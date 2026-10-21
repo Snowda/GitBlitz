@@ -1,0 +1,101 @@
+# Answers `git rev-parse --absolute-git-dir` / `git rev-parse HEAD` from the files under `.git`, so latency-bound
+# callers (FlareBlitz's hooks) skip a ~28 ms `git` spawn; anything the files can't settle falls back to git.
+[workspace]
+resolver = "3"
+
+[workspace.lints.rust]
+# deny (not forbid) so a dependency's macro-generated #[allow(unsafe_code)] can still compile.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# House style mandates explicit `return` on tail expressions, the inverse of clippy's default.
+needless_return = "allow"
+float_cmp = "deny"
+float_cmp_const = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+# CLI output goes through `writeln!` on a bound handle, never the print macros.
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_lossless = "warn"
+as_conversions = "warn"
+clone_on_copy = "warn"
+needless_pass_by_value = "warn"
+ptr_arg = "warn"
+box_collection = "warn"
+redundant_allocation = "warn"
+must_use_candidate = "warn"
+str_to_string = "deny"
+manual_filter_map = "warn"
+manual_find_map = "warn"
+disallowed_types = "deny"
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+too_many_arguments = "warn"
+type_complexity = "warn"
+excessive_nesting = "warn"
+missing_const_for_fn = "warn"
+too_long_first_doc_paragraph = "warn"
+future_not_send = "warn"
+redundant_clone = "deny"
+use_self = "deny"
+unreachable = "deny"
+
+[package]
+name = "gitblitz"
+version = "0.1.1"
+authors = ["Conor Forde"]
+rust-version = "1.97.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Snowda/GitBlitz"
+description = "Reads git dir and HEAD from .git files, falling back to git rev-parse"
+
+[features]
+# `list_files`: `git ls-files` answered from .git/index plus a gitignore-aware walk. Off by default, so
+# the latency-bound hook binary does not build the walker.
+list = ["dep:ignore"]
+# The `gitblitz` binary, whose optional stdin payload is JSON. Off by default, so library consumers do not build serde.
+cli = ["dep:serde_json"]
+
+[dependencies]
+arrayvec = { version = "0.7.8", default-features = false }
+thiserror = "2.0.20"
+ignore = { version = "0.4.33", optional = true }
+serde_json = { version = "1.0.151", optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[[bin]]
+name = "gitblitz"
+path = "src/bin/gitblitz/main.rs"
+required-features = ["cli"]
+
+# File reader vs `git rev-parse` latency per repo shape; `-- loop [secs]` is the FlareBlitz workload.
+[[bench]]
+name = "gitblitz"
+harness = false
+
+[lints]
+workspace = true
+
+# Line tables keep usable backtraces without full debuginfo.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Coverage profile for the bulwark daemon (cargo llvm-cov --lib --profile coverage).
+[profile.coverage]
+inherits = "dev"
+opt-level = 0
+debug = false
+
+[profile.coverage.package."*"]
+opt-level = 0

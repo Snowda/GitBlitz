@@ -1,0 +1,15 @@
+disallowed-types = [
+    { path = "std::sync::Mutex" },
+    { path = "std::sync::RwLock" },
+    { path = "tokio::sync::RwLock" },
+    { path = "std::borrow::Cow" },
+]
+
+disallowed-methods = [
+    { path = "std::env::var" },
+    { path = "std::env::var_os" },
+    { path = "std::env::vars" },
+    { path = "std::env::vars_os" },
+    { path = "std::env::set_var" },
+    { path = "std::env::remove_var" },
+]
