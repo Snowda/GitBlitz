@@ -1,0 +1,4 @@
+ref: refs/heads/main
+ÿ0123456789abcdef0123456789abcdef01234567
+ÿÿ[extensions]
+	refStorage = reftable

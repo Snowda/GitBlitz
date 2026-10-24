@@ -1,0 +1,7 @@
+ref: refs/heads/main
+ÿÿ# pack-refs with: peeled fully-peeled sorted 
+89abcdef0123456789abcdef0123456789abcdef refs/heads/main
+^0123456789abcdef0123456789abcdef01234567
+ÿ[core]
+	repositoryformatversion = 0
+	bare = false

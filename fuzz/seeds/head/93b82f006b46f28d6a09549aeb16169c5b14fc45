@@ -1,0 +1,6 @@
+ref: refs/heads/main
+ÿ0123456789abcdef0123456789abcdef01234567
+ÿ89abcdef0123456789abcdef0123456789abcdef refs/heads/main
+ÿ[core]
+	repositoryformatversion = 0
+	bare = false

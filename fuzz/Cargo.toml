@@ -1,0 +1,40 @@
+# Fuzz targets for GitBlitz's hostile-file boundaries (fleet standard: release_gate `default.fuzz`). A workspace
+# member, so it shares target/ and Cargo.lock; libFuzzer links only under `--cfg fuzzing`, on stable, in podman
+# (Void's tools/fuzz-campaign).
+[package]
+name = "gitblitz-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.99.1"
+
+[dependencies]
+gitblitz = { path = "..", features = ["list"] }
+tempfile = "3.27.0"
+
+[target.'cfg(fuzzing)'.dependencies]
+libfuzzer-sys = "0.4.13"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "index"
+path = "fuzz_targets/index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_roundtrip"
+path = "fuzz_targets/index_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "head"
+path = "fuzz_targets/head.rs"
+test = false
+doc = false
+bench = false

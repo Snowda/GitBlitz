@@ -1,0 +1,5 @@
+ref: refs/heads/main
+ÿref: refs/heads/other
+ÿÿ[core]
+	repositoryformatversion = 0
+	bare = false
