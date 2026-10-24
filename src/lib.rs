@@ -96,7 +96,7 @@ mod tests {
 
 	use tempfile::{tempdir, TempDir};
 
-	use super::{git_dir, head, oid_hex, read_git_dir, read_head, Cause, Error, GitEnv, Miss, MissReason, OidHex};
+	use super::{git_dir, head, oid_hex, read_git_dir, read_head, unless_redirected, Cause, Error, GitEnv, Miss, MissReason, OidHex};
 	use crate::small_file::SMALL_FILE_MAX;
 	use crate::testrepo::{commit, expect_err, git, git_fails, is_oid, new_repo, same_dir};
 
@@ -233,10 +233,7 @@ mod tests {
 		assert_eq!(expect_err(read_head(repo.path()), "read_head")?.reason, MissReason::Unborn);
 		let git_stderr: String = git_fails(repo.path(), &["rev-parse", "HEAD"])?;
 		let err: Error = expect_err(head(repo.path(), GitEnv::NONE), "head")?;
-		let Cause::Exit { stderr, .. } = &err.cause else {
-			return Err(format!("expected a git failure: {err}"));
-		};
-		assert_eq!(*stderr, git_stderr);
+		assert!(matches!(&err.cause, Cause::Exit { stderr, .. } if *stderr == git_stderr), "expected git's failure: {err}");
 		assert_eq!(err.miss.reason, MissReason::Unborn);
 		assert!(err.miss.path.ends_with("refs/heads/main"), "{}", err.miss.path.display());
 		return Ok(());
@@ -377,6 +374,48 @@ mod tests {
 		let bad: [(&str, &OsStr); 1] = [("GIT_DIR", gone.as_os_str())];
 		let err: Error = expect_err(git_dir(here.path(), GitEnv::new(&bad)), "git_dir(bad GIT_DIR)")?;
 		assert_eq!((err.miss.reason, err.miss.path.as_path()), (MissReason::GitEnv, Path::new("GIT_DIR")));
+		return Ok(());
+	}
+
+	fn reader_answer() -> Result<u8, Miss> {
+		return Ok(7);
+	}
+
+	// With no redirect the reader's answer comes back. A variable that redirects git replaces it with a `GitEnv` miss.
+	#[test]
+	fn unless_redirected_reads_only_without_a_redirect() {
+		assert_eq!(unless_redirected(GitEnv::NONE, reader_answer), Ok(7));
+		let harmless: [(&str, &OsStr); 1] = [("GIT_AUTHOR_NAME", OsStr::new("x"))];
+		assert_eq!(unless_redirected(GitEnv::new(&harmless), reader_answer), Ok(7));
+		let work_tree: [(&str, &OsStr); 2] = [("GIT_AUTHOR_NAME", OsStr::new("x")), ("GIT_WORK_TREE", OsStr::new("w"))];
+		let got: Result<u8, Miss> = unless_redirected(GitEnv::new(&work_tree), reader_answer);
+		assert_eq!(got, Err(Miss::new(Path::new("GIT_WORK_TREE"), MissReason::GitEnv)));
+	}
+
+	// A redirect to a git dir that does not exist skips the reader, and `head` relays git's own refusal.
+	#[test]
+	fn head_under_a_missing_git_dir_relays_gits_failure() -> Result<(), String> {
+		let repo: TempDir = committed_repo()?;
+		let gone: PathBuf = repo.path().join("no-such.git");
+		let bad: [(&str, &OsStr); 1] = [("GIT_DIR", gone.as_os_str())];
+		let err: Error = expect_err(head(repo.path(), GitEnv::new(&bad)), "head(bad GIT_DIR)")?;
+		assert_eq!((err.miss.reason, err.miss.path.as_path()), (MissReason::GitEnv, Path::new("GIT_DIR")));
+		assert_eq!(err.args, "rev-parse HEAD");
+		assert!(matches!(&err.cause, Cause::Exit { stderr, .. } if stderr.contains("not a git repository")), "{err}");
+		return Ok(());
+	}
+
+	// `list_files` passes git's failure through its `?` and does not return an empty list.
+	#[cfg(feature = "list")]
+	#[test]
+	fn list_files_under_a_missing_git_dir_relays_gits_failure() -> Result<(), String> {
+		let repo: TempDir = committed_repo()?;
+		let gone: PathBuf = repo.path().join("no-such.git");
+		let bad: [(&str, &OsStr); 1] = [("GIT_DIR", gone.as_os_str())];
+		let err: Error = expect_err(super::list_files(repo.path(), GitEnv::new(&bad)), "list_files(bad GIT_DIR)")?;
+		assert_eq!((err.miss.reason, err.miss.path.as_path()), (MissReason::GitEnv, Path::new("GIT_DIR")));
+		assert_eq!(err.args, "ls-files -z --cached --others --exclude-standard");
+		assert!(matches!(&err.cause, Cause::Exit { stderr, .. } if stderr.contains("not a git repository")), "{err}");
 		return Ok(());
 	}
 

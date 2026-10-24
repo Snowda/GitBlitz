@@ -139,10 +139,16 @@ fn without_dots(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
 	use std::fs;
+	use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 	use std::path::{Path, PathBuf};
 
-	use super::{read_git_dir, without_dots};
-	use crate::error::MissReason;
+	use tempfile::{tempdir, TempDir};
+
+	use super::{no_head, read_git_dir, without_dots};
+	#[cfg(windows)]
+	use super::is_drive_relative;
+	use crate::error::{Miss, MissReason};
+	use crate::small_file::SMALL_FILE_MAX;
 	use crate::testrepo::{expect_err, new_repo, same_dir};
 
 	#[test]
@@ -241,5 +247,123 @@ mod tests {
 	fn without_dots_drops_a_leading_current_dir_and_keeps_a_root_parent() {
 		assert_eq!(without_dots(Path::new("./x/y")), PathBuf::from("x/y"));
 		assert_eq!(without_dots(Path::new("a/../../b")), PathBuf::from("../b"));
+	}
+
+	// `path::absolute` refuses an empty path, so the miss names the path as given.
+	#[test]
+	fn an_empty_path_is_an_invalid_input_miss() {
+		let miss: Option<Miss> = read_git_dir(Path::new("")).err();
+		assert_eq!(miss, Some(Miss::new(Path::new(""), MissReason::Io(ErrorKind::InvalidInput))));
+	}
+
+	// Makes a work dir with a `.git` file that holds `text`. Returns the temp root, the work dir and the gitfile.
+	fn gitfile(text: &[u8]) -> IoResult<(TempDir, PathBuf, PathBuf)> {
+		let root: TempDir = tempdir()?;
+		let work: PathBuf = root.path().join("work");
+		fs::create_dir(&work)?;
+		let dot_git: PathBuf = work.join(".git");
+		fs::write(&dot_git, text)?;
+		return Ok((root, work, dot_git));
+	}
+
+	#[test]
+	fn an_unreadable_gitfile_is_an_io_miss_at_the_gitfile() -> IoResult<()> {
+		let (_root, work, dot_git) = gitfile(b"gitdir: caf\xe9\n")?;
+		assert_eq!(read_git_dir(&work).err(), Some(Miss::new(&dot_git, MissReason::Io(ErrorKind::InvalidData))));
+		let long: Vec<u8> = [b"gitdir: ".as_slice(), &[b'a'; SMALL_FILE_MAX]].concat();
+		fs::write(&dot_git, long)?;
+		assert_eq!(read_git_dir(&work).err(), Some(Miss::new(&dot_git, MissReason::Io(ErrorKind::FileTooLarge))));
+		return Ok(());
+	}
+
+	// After the prefix, an empty target or a target of only whitespace gives git no path.
+	#[test]
+	fn a_gitfile_with_an_empty_target_is_bad() -> IoResult<()> {
+		let (_root, work, dot_git) = gitfile(b"gitdir: \n")?;
+		assert_eq!(read_git_dir(&work).err(), Some(Miss::new(&dot_git, MissReason::BadGitFile)));
+		fs::write(&dot_git, b"gitdir: ")?;
+		assert_eq!(read_git_dir(&work).err(), Some(Miss::new(&dot_git, MissReason::BadGitFile)));
+		return Ok(());
+	}
+
+	// `/x` has a root but no drive on Windows, so the reader declines to guess which drive git would use.
+	#[cfg(windows)]
+	#[test]
+	fn a_drive_relative_gitfile_target_is_bad_on_windows() -> IoResult<()> {
+		let (_root, work, dot_git) = gitfile(b"gitdir: /repo/.git\n")?;
+		assert_eq!(read_git_dir(&work).err(), Some(Miss::new(&dot_git, MissReason::BadGitFile)));
+		assert!(is_drive_relative(Path::new("/x")) && !is_drive_relative(Path::new("C:/x")), "only a rootless drive counts");
+		assert!(!is_drive_relative(Path::new("x")), "a relative path has no root");
+		return Ok(());
+	}
+
+	// Only an absent HEAD or a directory is `NoHead`; another open error on a file stays an IO miss.
+	#[test]
+	fn no_head_keeps_other_errors_on_a_file_as_io() -> IoResult<()> {
+		let root: TempDir = tempdir()?;
+		let file: PathBuf = root.path().join("HEAD");
+		fs::write(&file, b"ref: refs/heads/main\n")?;
+		let denied: IoError = IoError::from(ErrorKind::PermissionDenied);
+		assert_eq!(no_head(&file, &denied), Miss::new(&file, MissReason::Io(ErrorKind::PermissionDenied)));
+		assert_eq!(no_head(root.path(), &denied), Miss::new(root.path(), MissReason::NoHead));
+		let absent: IoError = IoError::from(ErrorKind::NotFound);
+		assert_eq!(no_head(&file, &absent), Miss::new(&file, MissReason::NoHead));
+		return Ok(());
+	}
+
+	// A symlink to itself fails `stat` with ELOOP, an error that is not "absent", so git must decide.
+	// Windows needs a privilege to make a symlink, so these tests run on Unix only.
+	#[cfg(unix)]
+	fn self_link(path: &Path) -> IoResult<()> {
+		return std::os::unix::fs::symlink(path, path);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_looping_dot_git_in_the_start_dir_is_an_io_miss() -> IoResult<()> {
+		let root: TempDir = tempdir()?;
+		let dot_git: PathBuf = root.path().join(".git");
+		self_link(&dot_git)?;
+		let miss: Option<Miss> = read_git_dir(root.path()).err();
+		assert!(matches!(&miss, Some(m) if m.path == dot_git && matches!(m.reason, MissReason::Io(k) if k != ErrorKind::NotFound)), "{miss:?}");
+		return Ok(());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_looping_dot_git_in_an_ancestor_is_an_io_miss() -> IoResult<()> {
+		let root: TempDir = tempdir()?;
+		let dot_git: PathBuf = root.path().join(".git");
+		self_link(&dot_git)?;
+		let sub: PathBuf = root.path().join("sub");
+		fs::create_dir(&sub)?;
+		let miss: Option<Miss> = read_git_dir(&sub).err();
+		assert!(matches!(&miss, Some(m) if m.path == dot_git && matches!(m.reason, MissReason::Io(k) if k != ErrorKind::NotFound)), "{miss:?}");
+		return Ok(());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_looping_bare_head_candidate_is_an_io_miss() -> IoResult<()> {
+		let root: TempDir = tempdir()?;
+		let head: PathBuf = root.path().join("HEAD");
+		self_link(&head)?;
+		let miss: Option<Miss> = read_git_dir(root.path()).err();
+		assert!(matches!(&miss, Some(m) if m.path == head && matches!(m.reason, MissReason::Io(_))), "{miss:?}");
+		return Ok(());
+	}
+
+	// `link/..` is `x` to the kernel but `work` to a lexical fold; the two disagree, so git decides.
+	// Windows folds `..` before it follows a link, so the two always agree there and this branch is Unix-only.
+	#[cfg(unix)]
+	#[test]
+	fn a_gitfile_whose_dots_cross_a_symlink_is_bad() -> IoResult<()> {
+		let (root, work, _dot_git) = gitfile(b"gitdir: link/../.git\n")?;
+		let deep: PathBuf = root.path().join("x").join("y");
+		fs::create_dir_all(&deep)?;
+		std::os::unix::fs::symlink(&deep, work.join("link"))?;
+		let joined: PathBuf = work.join("link/../.git");
+		assert_eq!(read_git_dir(&work).err(), Some(Miss::new(&joined, MissReason::BadGitFile)));
+		return Ok(());
 	}
 }

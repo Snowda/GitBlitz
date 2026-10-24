@@ -78,4 +78,22 @@ mod tests {
 		assert!(matches!(got, Err(kind) if kind != ErrorKind::NotFound), "{got:?}");
 		return Ok(());
 	}
+
+	// Another handle's exclusive lock lets the open succeed but fails the read, so the read error reaches the caller.
+	// Unix locks are advisory and the directory test above covers the read error there. No test injects `Interrupted`.
+	#[cfg(windows)]
+	#[test]
+	fn a_read_error_after_the_open_is_returned() -> std::io::Result<()> {
+		const ERROR_LOCK_VIOLATION: i32 = 33;
+		let dir: TempDir = tempdir()?;
+		let path = dir.path().join("locked");
+		fs::write(&path, b"text")?;
+		let hold: fs::File = fs::File::open(&path)?;
+		hold.lock()?;
+		let mut buf: SmallBuf = [0; SMALL_FILE_MAX];
+		let got: Option<i32> = read_small(&path, &mut buf).err().and_then(|err| err.raw_os_error());
+		drop(hold);
+		assert_eq!(got, Some(ERROR_LOCK_VIOLATION));
+		return Ok(());
+	}
 }
