@@ -4,11 +4,10 @@
 //! (a walk alone would drop it). `--others --exclude-standard` is every other file on disk that the
 //! `.gitignore` files, `info/exclude` and the global excludes file let through, walked with the
 //! `ignore` crate. Paths come back relative to `dir`, as git prints them when run in `dir`.
-
+use foldhash::HashSet;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, WalkBuilder};
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
