@@ -1,6 +1,6 @@
 # Pins the toolchain so local builds and CI use the identical compiler.
 # Keep the channel in lockstep with workspace.package.rust-version in Cargo.toml.
 [toolchain]
-channel = "1.97.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
