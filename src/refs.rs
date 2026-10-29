@@ -6,6 +6,7 @@ use arrayvec::ArrayString;
 
 use crate::discover::{locate, no_head, HEAD_FILE};
 use crate::error::{Miss, MissReason};
+use crate::object_format::ObjectFormat;
 use crate::small_file::{read_small, SmallBuf, SMALL_FILE_MAX};
 
 const SYMREF_PREFIX: &str = "ref: ";
@@ -15,9 +16,8 @@ const PACKED_REFS_FILE: &str = "packed-refs";
 pub const CONFIG_FILE: &str = "config";
 const REF_STORAGE_KEY: &str = "refstorage";
 const LOCK_SUFFIX: &str = ".lock";
-pub const OID_HEX_LEN: usize = 40;
 /// Hex digits in a SHA-256 object id, the longest oid git prints.
-pub const OID_HEX_MAX: usize = 64;
+pub const OID_HEX_MAX: usize = ObjectFormat::Sha256.hex_len();
 
 /// A commit id in hex, held inline: 40 digits from the file reader, up to 64 from git for SHA-256 repos.
 pub type OidHex = ArrayString<OID_HEX_MAX>;
@@ -104,7 +104,7 @@ fn packed_entry<'a>(text: &'a str, refname: &str) -> Option<&'a str> {
 }
 
 fn oid(path: &Path, text: &str) -> Result<OidHex, Miss> {
-	if text.len() == OID_HEX_LEN && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+	if text.len() == ObjectFormat::Sha1.hex_len() && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
 		// 40 digits always fit; the map_err only satisfies the fallible constructor.
 		return OidHex::from(text).map_err(|_| Miss::new(path, MissReason::Malformed));
 	}

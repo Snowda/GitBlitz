@@ -14,6 +14,7 @@ mod index;
 mod isolating_config;
 #[cfg(feature = "list")]
 mod listing;
+mod object_format;
 mod refs;
 mod small_file;
 #[cfg(test)]
@@ -28,10 +29,10 @@ pub use refs::{read_head, OidHex, OID_HEX_MAX};
 #[cfg(feature = "list")]
 pub use listing::read_files;
 
-const GIT_DIR_ARGS: &str = "rev-parse --absolute-git-dir";
-const HEAD_ARGS: &str = "rev-parse HEAD";
+const GIT_DIR_ARGS: &[&str] = &["rev-parse", "--absolute-git-dir"];
+const HEAD_ARGS: &[&str] = &["rev-parse", "HEAD"];
 #[cfg(feature = "list")]
-const LS_FILES_ARGS: &str = "ls-files -z --cached --others --exclude-standard";
+const LS_FILES_ARGS: &[&str] = &["ls-files", "-z", "--cached", "--others", "--exclude-standard"];
 
 /// The absolute git directory for `dir`, as `git rev-parse --absolute-git-dir` run in `dir` with `env` reports it.
 ///
@@ -400,7 +401,7 @@ mod tests {
 		let bad: [(&str, &OsStr); 1] = [("GIT_DIR", gone.as_os_str())];
 		let err: Error = expect_err(head(repo.path(), GitEnv::new(&bad)), "head(bad GIT_DIR)")?;
 		assert_eq!((err.miss.reason, err.miss.path.as_path()), (MissReason::GitEnv, Path::new("GIT_DIR")));
-		assert_eq!(err.args, "rev-parse HEAD");
+		assert_eq!(err.args, ["rev-parse", "HEAD"]);
 		assert!(matches!(&err.cause, Cause::Exit { stderr, .. } if stderr.contains("not a git repository")), "{err}");
 		return Ok(());
 	}
@@ -414,7 +415,7 @@ mod tests {
 		let bad: [(&str, &OsStr); 1] = [("GIT_DIR", gone.as_os_str())];
 		let err: Error = expect_err(super::list_files(repo.path(), GitEnv::new(&bad)), "list_files(bad GIT_DIR)")?;
 		assert_eq!((err.miss.reason, err.miss.path.as_path()), (MissReason::GitEnv, Path::new("GIT_DIR")));
-		assert_eq!(err.args, "ls-files -z --cached --others --exclude-standard");
+		assert_eq!(err.args, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]);
 		assert!(matches!(&err.cause, Cause::Exit { stderr, .. } if stderr.contains("not a git repository")), "{err}");
 		return Ok(());
 	}

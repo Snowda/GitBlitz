@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 use crate::isolating_config::ISOLATING_CONFIG;
-use crate::refs::OID_HEX_LEN;
+use crate::object_format::ObjectFormat;
 
 fn run(dir: &Path, args: &[&str]) -> Result<Output, String> {
 	let got_new = match Command::new("git")
@@ -102,5 +102,5 @@ pub fn expect_err<T: Debug, E>(result: Result<T, E>, what: &str) -> Result<E, St
 }
 
 pub fn is_oid(text: &str) -> bool {
-	return text.len() == OID_HEX_LEN && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+	return text.len() == ObjectFormat::Sha1.hex_len() && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
 }

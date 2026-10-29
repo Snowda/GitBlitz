@@ -51,10 +51,10 @@ impl Miss {
 
 /// Both the file reader and the `git` fallback failed; [`Cause`] says how git failed.
 #[derive(Debug, ThisError)]
-#[error("`git {args}` in {} {cause} (file reader missed: {miss})", .dir.display())]
+#[error("`git {}` in {} {cause} (file reader missed: {miss})", .args.join(" "), .dir.display())]
 pub struct Error {
 	pub dir: PathBuf,
-	pub args: &'static str,
+	pub args: &'static [&'static str],
 	pub miss: Miss,
 	#[source]
 	pub cause: Cause,
@@ -68,6 +68,6 @@ pub enum Cause {
 	Exit { status: ExitStatus, stderr: String },
 	#[error("printed non-UTF-8 output")]
 	NotUtf8,
-	#[error("printed {0} bytes, more than the 64 hex digits of an object id")]
+	#[error("printed {len} bytes, more than the {max} hex digits of an object id", len = .0, max = crate::OID_HEX_MAX)]
 	NotAnOid(usize),
 }

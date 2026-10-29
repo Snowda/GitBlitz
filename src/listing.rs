@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::discover::{locate, require_head, Location, DOT_GIT};
 use crate::error::{Miss, MissReason};
 use crate::index;
+use crate::object_format::ObjectFormat;
 use crate::refs::{common_dir, CONFIG_FILE};
 
 const INDEX_FILE: &str = "index";
@@ -22,7 +23,6 @@ const INDEX_LOCK_FILE: &str = "index.lock";
 const INFO_EXCLUDE: &str = "info/exclude";
 const GITIGNORE_FILE: &str = ".gitignore";
 const OBJECT_FORMAT_KEY: &str = "objectformat";
-const SHA256: &str = "sha256";
 const IGNORE_CASE_KEY: &str = "ignorecase";
 const TRUE: &str = "true";
 
@@ -36,7 +36,7 @@ pub fn read_files(dir: &Path) -> Result<Vec<PathBuf>, Miss> {
 	let top: &Path = &top;
 	let common: PathBuf = common_dir(&git_dir)?;
 	let config: String = read_config(&common)?;
-	if config_says(&config, OBJECT_FORMAT_KEY, SHA256) {
+	if config_says(&config, OBJECT_FORMAT_KEY, ObjectFormat::Sha256.name()) {
 		return Err(Miss::new(&git_dir, MissReason::ObjectFormat));
 	}
 	let is_case_folded: bool = config_says(&config, IGNORE_CASE_KEY, TRUE);
@@ -182,14 +182,12 @@ mod tests {
 	use super::read_files;
 	use crate::env::GitEnv;
 	use crate::error::MissReason;
-	use crate::list_files;
 	use crate::testrepo::{commit, git, new_repo};
-
-	const LS_FILES: [&str; 5] = ["ls-files", "-z", "--cached", "--others", "--exclude-standard"];
+	use crate::{list_files, LS_FILES_ARGS};
 
 	// The oracle: what git itself lists from `dir`.
 	fn ls_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
-		let listed: String = git(dir, &LS_FILES)?;
+		let listed: String = git(dir, LS_FILES_ARGS)?;
 		let mut files: Vec<PathBuf> = listed.split('\0').filter(|p| !p.is_empty()).map(PathBuf::from).collect();
 		files.sort();
 		return Ok(files);

@@ -21,20 +21,38 @@ const USAGE: &str = "usage: gitblitz <git-dir|head> [DIR] \
 	| gitblitz hook clear --flag NAME [IN] \
 	| gitblitz gate --flag NAME [--require-file F]... [--skip-if PTR] [IN] -- <cmd> [args...] \
 	(IN: --dir D | --dir-from PTR; PTR: a JSON pointer into the stdin payload, such as /cwd)";
-const FLAG: &str = "--flag";
-const SUFFIX: &str = "--suffix";
-const REQUIRE_FILE: &str = "--require-file";
-const DIR: &str = "--dir";
-const DIR_FROM: &str = "--dir-from";
-const PATH: &str = "--path";
-const PATH_FROM: &str = "--path-from";
-const SKIP_IF: &str = "--skip-if";
-const MARK_KEYS: [&str; 6] = [FLAG, SUFFIX, DIR, DIR_FROM, PATH, PATH_FROM];
-const CLEAR_KEYS: [&str; 3] = [FLAG, DIR, DIR_FROM];
-const GATE_KEYS: [&str; 5] = [FLAG, REQUIRE_FILE, DIR, DIR_FROM, SKIP_IF];
 
-/// One `--key value` option, borrowed from the args.
-type Pair<'a> = (&'a str, &'a OsStr);
+/// A hook command's option name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+	Flag,
+	Suffix,
+	RequireFile,
+	Dir,
+	DirFrom,
+	Path,
+	PathFrom,
+	SkipIf,
+}
+
+impl Key {
+	fn parse(word: &str) -> Option<Self> {
+		return match word {
+			"--flag" => Some(Self::Flag),
+			"--suffix" => Some(Self::Suffix),
+			"--require-file" => Some(Self::RequireFile),
+			"--dir" => Some(Self::Dir),
+			"--dir-from" => Some(Self::DirFrom),
+			"--path" => Some(Self::Path),
+			"--path-from" => Some(Self::PathFrom),
+			"--skip-if" => Some(Self::SkipIf),
+			_ => None,
+		};
+	}
+}
+
+/// One `--key value` option, its value borrowed from the args.
+type Pair<'a> = (Key, &'a OsStr);
 
 /// How the process exits; `Gated` carries the gated command's own code through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,29 +136,32 @@ fn parse<'a>(args: &'a [OsString]) -> Option<Cli<'a>> {
 }
 
 fn parse_mark(args: &[OsString]) -> Option<(Source<'_>, HookAction<'_>)> {
-	let options: Options<'_> = Options::parse(args, &MARK_KEYS).filter(|options: &Options<'_>| return options.tail.is_empty())?;
-	let suffixes: Vec<&str> = options.all(SUFFIX).into_iter().map(OsStr::to_str).collect::<Option<_>>()?;
-	let action = HookAction::Mark { flag: options.flag()?, suffixes, path: options.source(PATH, PATH_FROM)? };
-	return Some((options.source(DIR, DIR_FROM)?, action));
+	let accepted: [Key; 6] = [Key::Flag, Key::Suffix, Key::Dir, Key::DirFrom, Key::Path, Key::PathFrom];
+	let options: Options<'_> = Options::parse(args, &accepted).filter(|options: &Options<'_>| return options.tail.is_empty())?;
+	let suffixes: Vec<&str> = options.all(Key::Suffix).into_iter().map(OsStr::to_str).collect::<Option<_>>()?;
+	let action = HookAction::Mark { flag: options.flag()?, suffixes, path: options.source(Key::Path, Key::PathFrom)? };
+	return Some((options.source(Key::Dir, Key::DirFrom)?, action));
 }
 
 fn parse_clear(args: &[OsString]) -> Option<(Source<'_>, HookAction<'_>)> {
-	let options: Options<'_> = Options::parse(args, &CLEAR_KEYS).filter(|options: &Options<'_>| return options.tail.is_empty())?;
-	return Some((options.source(DIR, DIR_FROM)?, HookAction::Clear { flag: options.flag()? }));
+	let accepted: [Key; 3] = [Key::Flag, Key::Dir, Key::DirFrom];
+	let options: Options<'_> = Options::parse(args, &accepted).filter(|options: &Options<'_>| return options.tail.is_empty())?;
+	return Some((options.source(Key::Dir, Key::DirFrom)?, HookAction::Clear { flag: options.flag()? }));
 }
 
 fn parse_gate(args: &[OsString]) -> Option<(Source<'_>, HookAction<'_>)> {
-	let options: Options<'_> = Options::parse(args, &GATE_KEYS)?;
+	let accepted: [Key; 5] = [Key::Flag, Key::RequireFile, Key::Dir, Key::DirFrom, Key::SkipIf];
+	let options: Options<'_> = Options::parse(args, &accepted)?;
 	let [_dash, program, args @ ..] = options.tail else {
 		return None;
 	};
-	let skip_if: Option<&str> = match options.at_most_one(SKIP_IF)? {
+	let skip_if: Option<&str> = match options.at_most_one(Key::SkipIf)? {
 		None => None,
 		Some(value) => Some(pointer(value)?),
 	};
-	let required: Vec<&Path> = options.all(REQUIRE_FILE).into_iter().map(Path::new).collect();
+	let required: Vec<&Path> = options.all(Key::RequireFile).into_iter().map(Path::new).collect();
 	let action = HookAction::Gate { flag: options.flag()?, required, skip_if, program, args };
-	return Some((options.source(DIR, DIR_FROM)?, action));
+	return Some((options.source(Key::Dir, Key::DirFrom)?, action));
 }
 
 // A payload field name: valid UTF-8 and a JSON pointer, not the whole document.
@@ -155,18 +176,18 @@ struct Options<'a> {
 }
 
 impl<'a> Options<'a> {
-	fn parse(args: &'a [OsString], accepted: &[&str]) -> Option<Self> {
+	fn parse(args: &'a [OsString], accepted: &[Key]) -> Option<Self> {
 		let (pairs, tail) = key_values(args)?;
 		let known: bool = pairs.iter().all(|&(key, _): &Pair<'_>| return accepted.contains(&key));
 		return known.then_some(Self { pairs, tail });
 	}
 
-	fn all(&self, wanted: &str) -> Vec<&'a OsStr> {
+	fn all(&self, wanted: Key) -> Vec<&'a OsStr> {
 		return self.pairs.iter().filter(|&&(key, _)| return key == wanted).map(|&(_, value)| return value).collect();
 	}
 
 	// `Some(None)` when absent, `None` (bad usage) when given more than once.
-	fn at_most_one(&self, wanted: &str) -> Option<Option<&'a OsStr>> {
+	fn at_most_one(&self, wanted: Key) -> Option<Option<&'a OsStr>> {
 		return match self.all(wanted)[..] {
 			[] => Some(None),
 			[value] => Some(Some(value)),
@@ -175,11 +196,11 @@ impl<'a> Options<'a> {
 	}
 
 	fn flag(&self) -> Option<Flag<'a>> {
-		return Flag::new(self.at_most_one(FLAG)??);
+		return Flag::new(self.at_most_one(Key::Flag)??);
 	}
 
 	// An input given as `arg`, as a payload field `from`, or not at all; both at once is bad usage.
-	fn source(&self, arg: &str, from: &str) -> Option<Source<'a>> {
+	fn source(&self, arg: Key, from: Key) -> Option<Source<'a>> {
 		return match (self.at_most_one(arg)?, self.at_most_one(from)?) {
 			(None, None) => Some(Source::Unset),
 			(Some(value), None) => Some(Source::Arg(value)),
@@ -189,7 +210,8 @@ impl<'a> Options<'a> {
 	}
 }
 
-// `--key value` pairs up to a `--` or the end, and the rest from that `--`; `None` on a lone or `--` value.
+// `--key value` pairs up to a `--` or the end, and the rest from that `--`; `None` on an unknown key or a lone
+// or `--` value.
 fn key_values(mut rest: &[OsString]) -> Option<(Vec<Pair<'_>>, &[OsString])> {
 	let mut pairs: Vec<Pair<'_>> = Vec::new();
 	loop {
@@ -197,7 +219,7 @@ fn key_values(mut rest: &[OsString]) -> Option<(Vec<Pair<'_>>, &[OsString])> {
 			[] => return Some((pairs, rest)),
 			[dash, ..] if dash == "--" => return Some((pairs, rest)),
 			[key, value, tail @ ..] if value != "--" => {
-				pairs.push((key.to_str()?, value));
+				pairs.push((Key::parse(key.to_str()?)?, value));
 				rest = tail;
 			}
 			_ => return None,
@@ -478,7 +500,7 @@ mod tests {
 
 	#[test]
 	fn bad_usage_prints_usage() -> Result<(), String> {
-		let cases: [&[&str]; 30] = [
+		let cases: [&[&str]; 32] = [
 			&[],
 			&["nope"],
 			&["head", "a", "b"],
@@ -492,6 +514,8 @@ mod tests {
 			&["hook", "mark", "--flag", "a", "--flag", "b"],
 			&["hook", "mark", "--flag", "a", "--require-file", "Cargo.toml"],
 			&["hook", "mark", "--flag", "a", "--skip-if", "/x"],
+			&["hook", "mark", "--flag", "a", "--nope", "x"],
+			&["gate", "--flag", "a", "--FLAG", "b", "--", "x"],
 			&["hook", "mark", "--flag", "a", "--dir", "d", "--dir-from", "/cwd"],
 			&["hook", "mark", "--flag", "a", "--dir", "d", "--dir", "e"],
 			&["hook", "mark", "--flag", "a", "--path", "a.rs", "--path-from", "/p"],

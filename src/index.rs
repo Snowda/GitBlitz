@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use crate::error::{Miss, MissReason};
+use crate::object_format::ObjectFormat;
 
 const SIGNATURE: &[u8; 4] = b"DIRC";
 const HEADER_LEN: usize = 12;
@@ -15,7 +16,7 @@ const PATH_COMPRESSED_VERSION: u32 = 4;
 const MAX_VERSION: u32 = 4;
 // ctime, mtime (8 each), dev, ino, mode, uid, gid, size (4 each), the SHA-1, and the flags word.
 const MODE_OFFSET: usize = 24;
-const SHA1_LEN: usize = 20;
+const SHA1_LEN: usize = ObjectFormat::Sha1.raw_len();
 const ENTRY_FIXED_LEN: usize = 40 + SHA1_LEN + 2;
 const EXTENDED_FLAGS_LEN: usize = 2;
 const FLAG_EXTENDED: u16 = 0x4000;
