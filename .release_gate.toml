@@ -1,0 +1,27 @@
+# Release Readiness controls for GitBlitz.
+project = "GitBlitz"
+schema = 1
+
+[[control]]
+id = "GitBlitz::default.pulumi"
+title = "No Pulumi infrastructure in this repo"
+assertion = "GitBlitz is a library and hook binary with no infrastructure; Pulumi presence check opted out."
+theme = "other"
+gate = "advisory"
+severity = "low"
+
+[control.check]
+kind = "pulumi"
+policy = "off"
+
+[[control]]
+id = "GitBlitz::default.openapi"
+title = "No OpenAPI spec in this repo"
+assertion = "GitBlitz is a library and hook binary and serves no HTTP API; OpenAPI presence check opted out."
+theme = "other"
+gate = "advisory"
+severity = "low"
+
+[control.check]
+kind = "openapi"
+policy = "off"
