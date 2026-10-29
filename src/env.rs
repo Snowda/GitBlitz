@@ -37,9 +37,10 @@ impl<'a> GitEnv<'a> {
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashMap;
 	use std::ffi::OsStr;
 	use std::process::Command;
+
+	use foldhash::HashMap;
 
 	use super::{GitEnv, REDIRECTING};
 

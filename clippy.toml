@@ -1,4 +1,9 @@
 disallowed-types = [
+    # SipHash (std's default hasher) is slow: use foldhash by default, ahash where a peer picks keys, rapidhash for stable output.
+    { path = "std::collections::HashMap", reason = "SipHash by default; use foldhash::HashMap, ahash::AHashMap or a rapidhash map" },
+    { path = "std::collections::HashSet", reason = "SipHash by default; use foldhash::HashSet, ahash::AHashSet or a rapidhash set" },
+    { path = "std::hash::RandomState", reason = "SipHash; use the foldhash, ahash or rapidhash state" },
+    { path = "std::hash::DefaultHasher", reason = "SipHash; use rapidhash::fast::RapidHasher for stable hashes" },
     { path = "std::sync::Mutex" },
     { path = "std::sync::RwLock" },
     { path = "tokio::sync::RwLock" },
