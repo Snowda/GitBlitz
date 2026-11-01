@@ -8,6 +8,7 @@ disallowed-types = [
     { path = "std::sync::RwLock" },
     { path = "tokio::sync::RwLock" },
     { path = "std::borrow::Cow" },
+    { path = "std::io::Write", reason = "use tracing instead of writing output directly" },
 ]
 
 disallowed-methods = [
