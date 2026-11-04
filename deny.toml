@@ -46,6 +46,7 @@ deny = [
     # Hermetic, cross-compilable builds only — TLS must go through rustls, never openssl.
     { name = "openssl" },
     { name = "openssl-sys" },
+    { crate = "reqwest", reason = "use hyper (hyper-util client) instead of reqwest" },
 ]
 
 [sources]
