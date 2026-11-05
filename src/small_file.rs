@@ -42,27 +42,28 @@ mod tests {
 
 	use super::{read_small, SmallBuf, SMALL_FILE_MAX};
 
-	fn kind_or_text(bytes: &[u8]) -> Result<Result<String, ErrorKind>, String> {
+	// The text borrows `buf`, which outlives the scratch file.
+	fn kind_or_text<'b>(bytes: &[u8], buf: &'b mut SmallBuf) -> Result<Result<&'b str, ErrorKind>, String> {
 		let dir: TempDir = tempdir().map_err(|err| format!("tempdir(): {err:?}"))?;
 		let path = dir.path().join("f");
 		fs::write(&path, bytes).map_err(|err| format!("write: {err:?}"))?;
-		let mut buf: SmallBuf = [0; SMALL_FILE_MAX];
-		return Ok(read_small(&path, &mut buf).map(str::to_owned).map_err(|err| err.kind()));
+		return Ok(read_small(&path, buf).map_err(|err| err.kind()));
 	}
 
 	#[test]
 	fn reads_up_to_the_buffer_and_refuses_a_file_that_fills_it() -> Result<(), String> {
 		let longest: String = "a".repeat(SMALL_FILE_MAX - 1);
-		assert_eq!(kind_or_text(longest.as_bytes())?, Ok(longest.clone()));
-		assert_eq!(kind_or_text(b"")?, Ok(String::new()));
-		assert_eq!(kind_or_text(format!("{longest}b").as_bytes())?, Err(ErrorKind::FileTooLarge));
-		assert_eq!(kind_or_text(format!("{longest}{longest}").as_bytes())?, Err(ErrorKind::FileTooLarge));
+		let mut buf: SmallBuf = [0; SMALL_FILE_MAX];
+		assert_eq!(kind_or_text(format!("{longest}b").as_bytes(), &mut buf)?, Err(ErrorKind::FileTooLarge));
+		assert_eq!(kind_or_text(format!("{longest}{longest}").as_bytes(), &mut buf)?, Err(ErrorKind::FileTooLarge));
+		assert_eq!(kind_or_text(b"", &mut buf)?, Ok(""));
+		assert_eq!(kind_or_text(longest.as_bytes(), &mut buf)?, Ok(longest.as_str()));
 		return Ok(());
 	}
 
 	#[test]
 	fn non_utf8_is_invalid_data_and_a_missing_file_is_not_found() -> Result<(), String> {
-		assert_eq!(kind_or_text(b"caf\xe9")?, Err(ErrorKind::InvalidData));
+		assert_eq!(kind_or_text(b"caf\xe9", &mut [0; SMALL_FILE_MAX])?, Err(ErrorKind::InvalidData));
 		let dir: TempDir = tempdir().map_err(|err| format!("tempdir(): {err:?}"))?;
 		let mut buf: SmallBuf = [0; SMALL_FILE_MAX];
 		assert_eq!(read_small(&dir.path().join("absent"), &mut buf).map_err(|err| err.kind()), Err(ErrorKind::NotFound));

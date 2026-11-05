@@ -36,10 +36,16 @@ pub fn marker(dir: &Path, flag: Flag<'_>) -> Option<PathBuf> {
 }
 
 /// Touches the marker when `edited` ends in one of `suffixes` (any call, if none); returns the marker touched.
-pub fn mark(dir: &Path, edited: Option<&OsStr>, flag: Flag<'_>, suffixes: &[&str]) -> Result<Option<PathBuf>, IoError> {
-	let is_marked: bool = suffixes.is_empty()
+pub fn mark(
+	dir: &Path,
+	edited: Option<&OsStr>,
+	flag: Flag<'_>,
+	suffixes: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> Result<Option<PathBuf>, IoError> {
+	let mut suffixes = suffixes.into_iter().peekable();
+	let is_marked: bool = suffixes.peek().is_none()
 		|| edited.is_some_and(|path: &OsStr| {
-			return suffixes.iter().any(|suffix: &&str| return path.as_encoded_bytes().ends_with(suffix.as_bytes()));
+			return suffixes.any(|suffix| return path.as_encoded_bytes().ends_with(suffix.as_ref().as_encoded_bytes()));
 		});
 	let Some(path) = is_marked.then(|| return marker(dir, flag)).flatten() else {
 		return Ok(None);
@@ -62,8 +68,8 @@ pub fn clear(dir: &Path, flag: Flag<'_>) -> Result<bool, IoError> {
 
 /// Whether a gated command should run: `dir` holds every `required` file and its marker is set.
 #[must_use]
-pub fn gate(dir: &Path, flag: Flag<'_>, required: &[&Path]) -> Verdict {
-	if !required.iter().all(|file: &&Path| return dir.join(file).is_file()) {
+pub fn gate(dir: &Path, flag: Flag<'_>, required: impl IntoIterator<Item = impl AsRef<Path>>) -> Verdict {
+	if !required.into_iter().all(|file| return dir.join(file).is_file()) {
 		return Verdict::Skip("a required file is missing from the dir");
 	}
 	return match marker(dir, flag) {
@@ -86,6 +92,7 @@ mod tests {
 	const NAME: &str = "test-edit-flag";
 	const SUFFIXES: [&str; 2] = [".rs", ".toml"];
 	const CRATE: [&str; 1] = ["Cargo.toml"];
+	const NONE: [&str; 0] = [];
 
 	fn flag() -> Result<Flag<'static>, String> {
 		return Flag::new(OsStr::new(NAME)).ok_or_else(|| return format!("Flag::new({NAME:?}) is None"));
@@ -105,7 +112,7 @@ mod tests {
 			.args(args)
 			.current_dir(dir)
 			.output() { Ok(value) => value, Err(err) => return Err(format!("Command::new: {err:?}")) };
-		assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+		assert!(out.status.success(), "git {args:?}: {}", out.stderr.escape_ascii());
 		return Ok(());
 	}
 
@@ -117,7 +124,7 @@ mod tests {
 		git(&main, &["init", "-q", "-b", "main"])?;
 		fs::write(main.join("Cargo.toml"), "[package]\n").map_err(|err| format!("write Cargo.toml: {err:?}"))?;
 		let wt: PathBuf = tmp.path().join("wt");
-		let wt_arg: &str = wt.to_str().ok_or_else(|| String::from("wt.to_str() is None"))?;
+		let wt_arg: &str = wt.to_str().ok_or("wt.to_str() is None")?;
 		let steps: [&[&str]; 3] =
 			[&["add", "Cargo.toml"], &["commit", "-q", "--no-verify", "-m", "one"], &["worktree", "add", "-q", "-b", "side", wt_arg]];
 		steps.iter().try_for_each(|args: &&[&str]| return git(&main, args))?;
@@ -129,13 +136,13 @@ mod tests {
 		let (_tmp, wt) = crate_with_worktree()?;
 		let (flag, files) = (flag()?, crate_files());
 		assert!(fs::write(wt.join(".git").join(NAME), "").is_err(), "the old .git/ marker path cannot exist here");
-		assert_eq!(gate(&wt, flag, &files), Verdict::Skip("no edit marker"));
-		let got_mark = mark(&wt, edit("src/lib.rs"), flag, &SUFFIXES).map_err(|err| format!("mark: {err:?}"))?;
-		let touched: PathBuf = got_mark.ok_or_else(|| String::from("a .rs edit marks"))?;
+		assert_eq!(gate(&wt, flag, files), Verdict::Skip("no edit marker"));
+		let got_mark = mark(&wt, edit("src/lib.rs"), flag, SUFFIXES).map_err(|err| format!("mark: {err:?}"))?;
+		let touched: PathBuf = got_mark.ok_or("a .rs edit marks")?;
 		assert!(touched.ends_with(Path::new("worktrees").join("wt").join(NAME)), "{}", touched.display());
-		assert_eq!(gate(&wt, flag, &files), Verdict::Run);
+		assert_eq!(gate(&wt, flag, files), Verdict::Run);
 		assert!(clear(&wt, flag).map_err(|err| format!("clear: {err:?}"))?);
-		assert_eq!(gate(&wt, flag, &files), Verdict::Skip("no edit marker"));
+		assert_eq!(gate(&wt, flag, files), Verdict::Skip("no edit marker"));
 		assert!(!clear(&wt, flag).map_err(|err| format!("clear: {err:?}"))?);
 		return Ok(());
 	}
@@ -144,19 +151,19 @@ mod tests {
 	fn only_edits_with_a_listed_suffix_mark() -> Result<(), String> {
 		let (_tmp, wt) = crate_with_worktree()?;
 		let (flag, files) = (flag()?, crate_files());
-		let mark_one = |edited: Option<&OsStr>| return mark(&wt, edited, flag, &SUFFIXES).map_err(|err| format!("mark: {err:?}"));
+		let mark_one = |edited: Option<&OsStr>| return mark(&wt, edited, flag, SUFFIXES).map_err(|err| format!("mark: {err:?}"));
 		assert_eq!(mark_one(edit("README.md"))?, None);
 		assert_eq!(mark_one(None)?, None);
-		assert_eq!(gate(&wt, flag, &files), Verdict::Skip("no edit marker"));
+		assert_eq!(gate(&wt, flag, files), Verdict::Skip("no edit marker"));
 		assert!(mark_one(edit("C:/x/Cargo.toml"))?.is_some());
-		assert_eq!(gate(&wt, flag, &files), Verdict::Run);
+		assert_eq!(gate(&wt, flag, files), Verdict::Run);
 		return Ok(());
 	}
 
 	#[test]
 	fn no_suffixes_means_every_call_marks() -> Result<(), String> {
 		let (_tmp, wt) = crate_with_worktree()?;
-		let got: Option<PathBuf> = mark(&wt, None, flag()?, &[]).map_err(|err| format!("mark: {err:?}"))?;
+		let got: Option<PathBuf> = mark(&wt, None, flag()?, NONE).map_err(|err| format!("mark: {err:?}"))?;
 		assert!(got.is_some_and(|path: PathBuf| return path.is_file()));
 		return Ok(());
 	}
@@ -165,14 +172,14 @@ mod tests {
 	#[test]
 	fn each_flag_name_is_its_own_marker() -> Result<(), String> {
 		let (_tmp, wt) = crate_with_worktree()?;
-		let other: Flag<'_> = Flag::new(OsStr::new("other-flag")).ok_or_else(|| String::from("other-flag is valid"))?;
+		let other: Flag<'_> = Flag::new(OsStr::new("other-flag")).ok_or("other-flag is valid")?;
 		let (flag, files) = (flag()?, crate_files());
-		let touched: Option<PathBuf> = mark(&wt, edit("a.rs"), flag, &SUFFIXES).map_err(|err| format!("mark: {err:?}"))?;
+		let touched: Option<PathBuf> = mark(&wt, edit("a.rs"), flag, SUFFIXES).map_err(|err| format!("mark: {err:?}"))?;
 		assert!(touched.is_some_and(|path: PathBuf| return path.file_name() == Some(OsStr::new(NAME))));
-		assert_eq!(gate(&wt, flag, &files), Verdict::Run);
-		assert_eq!(gate(&wt, other, &files), Verdict::Skip("no edit marker"));
+		assert_eq!(gate(&wt, flag, files), Verdict::Run);
+		assert_eq!(gate(&wt, other, files), Verdict::Skip("no edit marker"));
 		assert!(!clear(&wt, other).map_err(|err| format!("clear: {err:?}"))?);
-		assert_eq!(gate(&wt, flag, &files), Verdict::Run, "clearing another flag leaves this one");
+		assert_eq!(gate(&wt, flag, files), Verdict::Run, "clearing another flag leaves this one");
 		return Ok(());
 	}
 
@@ -180,13 +187,13 @@ mod tests {
 	fn gate_skips_dirs_missing_a_required_file() -> Result<(), String> {
 		let (_tmp, wt) = crate_with_worktree()?;
 		let (flag, files) = (flag()?, crate_files());
-		mark(&wt, edit("a.rs"), flag, &SUFFIXES).map_err(|err| format!("mark: {err:?}"))?;
+		mark(&wt, edit("a.rs"), flag, SUFFIXES).map_err(|err| format!("mark: {err:?}"))?;
 		let sub: PathBuf = wt.join("docs");
 		fs::create_dir(&sub).map_err(|err| format!("fs::create_dir(&sub): {err:?}"))?;
-		assert_eq!(gate(&sub, flag, &files), Verdict::Skip("a required file is missing from the dir"));
-		assert_eq!(gate(&sub, flag, &[]), Verdict::Run, "nothing required: the marker alone decides");
+		assert_eq!(gate(&sub, flag, files), Verdict::Skip("a required file is missing from the dir"));
+		assert_eq!(gate(&sub, flag, NONE), Verdict::Run, "nothing required: the marker alone decides");
 		let both: [&Path; 2] = [Path::new("Cargo.toml"), Path::new("absent.lock")];
-		assert_eq!(gate(&wt, flag, &both), Verdict::Skip("a required file is missing from the dir"));
+		assert_eq!(gate(&wt, flag, both), Verdict::Skip("a required file is missing from the dir"));
 		return Ok(());
 	}
 
@@ -204,7 +211,7 @@ mod tests {
 	fn outside_a_repo_nothing_is_marked_or_cleared() -> Result<(), String> {
 		let tmp: TempDir = tempfile::tempdir().map_err(|err| format!("tempfile::tempdir(): {err:?}"))?;
 		let flag: Flag<'_> = flag()?;
-		assert_eq!(mark(tmp.path(), edit("a.rs"), flag, &SUFFIXES).map_err(|err| format!("mark: {err:?}"))?, None);
+		assert_eq!(mark(tmp.path(), edit("a.rs"), flag, SUFFIXES).map_err(|err| format!("mark: {err:?}"))?, None);
 		assert!(!clear(tmp.path(), flag).map_err(|err| format!("clear: {err:?}"))?);
 		return Ok(());
 	}

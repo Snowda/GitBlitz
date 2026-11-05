@@ -1,5 +1,6 @@
 // The optional JSON payload on stdin; the caller names each field it wants with an RFC 6901 pointer.
 
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::io::{self, Read};
 
 use serde_json::Value;
@@ -24,21 +25,32 @@ pub fn is_pointer(pointer: &str) -> bool {
 	return pointer.starts_with('/');
 }
 
+/// A payload field that is present with another JSON type than the caller wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongType<'p> {
+	pub pointer: &'p str,
+	pub want: &'static str,
+}
+
+impl Display for WrongType<'_> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+		return write!(f, "payload field {} is not a {}", self.pointer, self.want);
+	}
+}
+
 /// The string at `pointer`; absent or `null` is `None`, any other type is an error.
-pub fn text<'v>(payload: &'v Value, pointer: &str) -> Result<Option<&'v str>, String> {
+pub fn text<'v, 'p>(payload: &'v Value, pointer: &'p str) -> Result<Option<&'v str>, WrongType<'p>> {
 	return match payload.pointer(pointer) {
 		None | Some(Value::Null) => Ok(None),
-		Some(Value::String(text)) => Ok(Some(text)),
-		Some(_) => Err(format!("payload field {pointer} is not a string")),
+		Some(value) => value.as_str().map(Some).ok_or(WrongType { pointer, want: "string" }),
 	};
 }
 
 /// The bool at `pointer`; absent or `null` is `false`, any other type is an error.
-pub fn truth(payload: &Value, pointer: &str) -> Result<bool, String> {
+pub fn truth<'p>(payload: &Value, pointer: &'p str) -> Result<bool, WrongType<'p>> {
 	return match payload.pointer(pointer) {
 		None | Some(Value::Null) => Ok(false),
-		Some(Value::Bool(truth)) => Ok(*truth),
-		Some(_) => Err(format!("payload field {pointer} is not a bool")),
+		Some(value) => value.as_bool().ok_or(WrongType { pointer, want: "bool" }),
 	};
 }
 
@@ -46,7 +58,7 @@ pub fn truth(payload: &Value, pointer: &str) -> Result<bool, String> {
 mod tests {
 	use serde_json::{json, Value};
 
-	use super::{is_pointer, read, text, truth};
+	use super::{is_pointer, read, text, truth, WrongType};
 
 	#[test]
 	fn empty_or_bom_only_stdin_is_null_and_a_bom_before_json_is_dropped() -> Result<(), String> {
@@ -59,7 +71,7 @@ mod tests {
 	}
 
 	#[test]
-	fn fields_are_found_by_pointer_and_absent_or_null_means_unset() -> Result<(), String> {
+	fn fields_are_found_by_pointer_and_absent_or_null_means_unset() -> Result<(), WrongType<'static>> {
 		let payload: Value = json!({"cwd": "C:/r", "tool": {"path": "a.rs"}, "again": true, "gone": null});
 		assert_eq!(text(&payload, "/cwd")?, Some("C:/r"));
 		assert_eq!(text(&payload, "/tool/path")?, Some("a.rs"));
@@ -75,8 +87,9 @@ mod tests {
 	#[test]
 	fn a_field_of_the_wrong_type_is_an_error_not_a_default() {
 		let payload: Value = json!({"cwd": 5, "again": "yes"});
-		assert_eq!(text(&payload, "/cwd"), Err(String::from("payload field /cwd is not a string")));
-		assert_eq!(truth(&payload, "/again"), Err(String::from("payload field /again is not a bool")));
+		assert_eq!(text(&payload, "/cwd"), Err(WrongType { pointer: "/cwd", want: "string" }));
+		assert_eq!(truth(&payload, "/again"), Err(WrongType { pointer: "/again", want: "bool" }));
+		assert_eq!(WrongType { pointer: "/cwd", want: "string" }.to_string(), "payload field /cwd is not a string");
 	}
 
 	#[test]

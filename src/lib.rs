@@ -1,13 +1,18 @@
-//! Answers `git rev-parse --absolute-git-dir` and `git rev-parse HEAD` by reading files under `.git`.
+//! Answers `git rev-parse --absolute-git-dir` and `git rev-parse HEAD` by reading files under `.git`, and
+//! `git cat-file --batch` / `git ls-tree -l` by reading the object store ([`objects`], [`tree_entries`]).
 //!
 //! [`git_dir`] and [`head`] try the file path first and spawn `git rev-parse` only when it cannot answer for
 //! sure; [`read_git_dir`] and [`read_head`] are the file path alone, returning a [`Miss`] instead of spawning.
 //! The caller passes the `GIT_*` variables git should see as a [`GitEnv`]; GitBlitz reads no environment itself.
 
+mod config;
 mod discover;
 mod env;
 mod error;
 mod fallback;
+mod git_objects;
+#[cfg(feature = "list")]
+mod file_list;
 #[cfg(feature = "list")]
 mod index;
 #[cfg(test)]
@@ -15,6 +20,7 @@ mod isolating_config;
 #[cfg(feature = "list")]
 mod listing;
 mod object_format;
+mod objects;
 mod refs;
 mod small_file;
 #[cfg(test)]
@@ -25,7 +31,14 @@ use std::path::{Path, PathBuf};
 pub use discover::read_git_dir;
 pub use env::GitEnv;
 pub use error::{Cause, Error, Miss, MissReason};
+pub use git_objects::{objects, tree_entries};
+pub use objects::{
+	read_object, read_object_header, read_objects, read_tree_entries, read_tree_entry, Header, Object, ObjectKind, Oid,
+	OidError, TreeEntry,
+};
 pub use refs::{read_head, OidHex, OID_HEX_MAX};
+#[cfg(feature = "list")]
+pub use file_list::FileList;
 #[cfg(feature = "list")]
 pub use listing::read_files;
 
@@ -76,12 +89,11 @@ fn oid_hex(text: &str) -> Result<OidHex, Cause> {
 /// # Errors
 /// [`Error`] when the file path missed and `git` failed too.
 #[cfg(feature = "list")]
-pub fn list_files(dir: &Path, env: GitEnv<'_>) -> Result<Vec<PathBuf>, Error> {
+pub fn list_files(dir: &Path, env: GitEnv<'_>) -> Result<FileList, Error> {
 	return match unless_redirected(env, || return read_files(dir)) {
 		Ok(files) => Ok(files),
 		Err(miss) => {
-			let listed: String = fallback::rev_parse(dir, LS_FILES_ARGS, env, miss)?;
-			let mut files: Vec<PathBuf> = listed.split('\0').filter(|p| !p.is_empty()).map(PathBuf::from).collect();
+			let mut files: FileList = FileList::from_nul_separated(fallback::rev_parse(dir, LS_FILES_ARGS, env, miss)?);
 			files.sort();
 			Ok(files)
 		}
@@ -99,7 +111,7 @@ mod tests {
 
 	use super::{git_dir, head, oid_hex, read_git_dir, read_head, unless_redirected, Cause, Error, GitEnv, Miss, MissReason, OidHex};
 	use crate::small_file::SMALL_FILE_MAX;
-	use crate::testrepo::{commit, expect_err, git, git_fails, is_oid, new_repo, same_dir};
+	use crate::testrepo::{commit, expect_err, git, git_fails, is_oid, new_repo, ok, rev, same_dir};
 
 	fn utf8(path: &Path) -> Result<&str, String> {
 		return path.to_str().ok_or_else(|| format!("{} is not UTF-8", path.display()));
@@ -113,27 +125,27 @@ mod tests {
 	}
 
 	fn assert_git_dir_matches(dir: &Path) -> Result<(), String> {
-		let fast: PathBuf = read_git_dir(dir).map_err(|err| format!("fast path should answer: {err:?}"))?;
+		let fast: PathBuf = ok(read_git_dir(dir), "fast path should answer")?;
 		let truth: String = git(dir, &["rev-parse", "--absolute-git-dir"])?;
 		assert!(same_dir(&fast, Path::new(&truth))?, "{} vs git {truth}", fast.display());
-		let slow: PathBuf = git_dir(dir, GitEnv::NONE).map_err(|err| format!("git_dir(dir): {err:?}"))?;
+		let slow: PathBuf = ok(git_dir(dir, GitEnv::NONE), "git_dir(dir)")?;
 		assert!(same_dir(&slow, Path::new(&truth))?);
 		return Ok(());
 	}
 
-	fn assert_head_matches(dir: &Path) -> Result<String, String> {
-		let fast: OidHex = read_head(dir).map_err(|err| format!("fast path should answer: {err:?}"))?;
+	fn assert_head_matches(dir: &Path) -> Result<OidHex, String> {
+		let fast: OidHex = ok(read_head(dir), "fast path should answer")?;
 		assert_eq!(fast.as_str(), git(dir, &["rev-parse", "HEAD"])?);
-		assert_eq!(head(dir, GitEnv::NONE).map_err(|err| format!("head(dir): {err:?}"))?, fast);
+		assert_eq!(ok(head(dir, GitEnv::NONE), "head(dir)")?, fast);
 		assert!(is_oid(&fast), "{fast}");
-		return Ok(fast.as_str().to_owned());
+		return Ok(fast);
 	}
 
 	// The reader misses for `reason`, and `head` still answers what git prints.
 	fn assert_head_falls_back(dir: &Path, reason: MissReason) -> Result<Miss, String> {
 		let miss: Miss = expect_err(read_head(dir), "read_head")?;
 		assert_eq!(miss.reason, reason);
-		let slow: OidHex = head(dir, GitEnv::NONE).map_err(|err| format!("head: {err:?}"))?;
+		let slow: OidHex = ok(head(dir, GitEnv::NONE), "head")?;
 		assert_eq!(slow.as_str(), git(dir, &["rev-parse", "HEAD"])?);
 		return Ok(miss);
 	}
@@ -142,7 +154,7 @@ mod tests {
 	#[test]
 	fn oid_hex_keeps_up_to_64_digits_and_refuses_more() -> Result<(), String> {
 		let longest: String = "ab".repeat(32);
-		let whole: OidHex = oid_hex(&longest).map_err(|err| format!("oid_hex(64 digits): {err:?}"))?;
+		let whole: OidHex = ok(oid_hex(&longest), "oid_hex(64 digits)")?;
 		assert_eq!(whole.as_str(), longest);
 		assert!(matches!(oid_hex(&format!("{longest}0")), Err(Cause::NotAnOid(65))));
 		assert_eq!(Cause::NotAnOid(65).to_string(), "printed 65 bytes, more than the 64 hex digits of an object id");
@@ -161,32 +173,49 @@ mod tests {
 	fn subdirectory_climbs_to_the_repo() -> Result<(), String> {
 		let repo: TempDir = committed_repo()?;
 		let sub: PathBuf = repo.path().join("a").join("b");
-		fs::create_dir_all(&sub).map_err(|err| format!("create {}: {err:?}", sub.display()))?;
+		ok(fs::create_dir_all(&sub), "create a/b")?;
 		assert_git_dir_matches(&sub)?;
 		assert_head_matches(&sub)?;
 		return Ok(());
 	}
 
-	// The reader misses on a SHA-256 repo's 64-hex ref, so `head` relays git's answer whole.
+	// The config selects SHA-256, so the reader takes the 64-hex ref itself; a packed ref reads the same.
 	#[test]
 	fn sha256_repo_head_is_what_git_prints() -> Result<(), String> {
-		let repo: TempDir = tempdir().map_err(|err| format!("tempdir(): {err:?}"))?;
+		let repo: TempDir = ok(tempdir(), "tempdir()")?;
 		git(repo.path(), &["init", "-q", "-b", "main", "--object-format=sha256"])?;
 		commit(repo.path(), "one")?;
-		let truth: String = git(repo.path(), &["rev-parse", "HEAD"])?;
+		let truth: OidHex = rev(repo.path(), "HEAD")?;
 		assert_eq!(truth.len(), 64, "{truth}");
-		assert_head_falls_back(repo.path(), MissReason::Malformed)?;
+		let fast: OidHex = ok(read_head(repo.path()), "read_head")?;
+		assert_eq!(fast, truth);
+		git(repo.path(), &["pack-refs", "--all"])?;
+		assert_eq!(ok(read_head(repo.path()), "read_head(packed)")?, truth);
+		assert_eq!(ok(head(repo.path(), GitEnv::NONE), "head")?, fast);
+		return Ok(());
+	}
+
+	// An object format the reader does not know is git's to judge, so the reader misses at the config.
+	#[test]
+	fn an_unknown_object_format_misses_at_the_config() -> Result<(), String> {
+		let repo: TempDir = committed_repo()?;
+		let config: PathBuf = repo.path().join(".git/config");
+		let mut file = ok(OpenOptions::new().append(true).open(&config), "open config")?;
+		ok(file.write_all(b"[extensions]\n\tobjectFormat = SHA-1\n"), "append config")?;
+		drop(file);
+		let miss: Miss = expect_err(read_head(repo.path()), "read_head")?;
+		assert_eq!((miss.reason, miss.path), (MissReason::ObjectFormat, config));
 		return Ok(());
 	}
 
 	#[test]
 	fn head_tracks_a_new_commit() -> Result<(), String> {
 		let repo: TempDir = committed_repo()?;
-		let before: String = assert_head_matches(repo.path())?;
+		let before: OidHex = assert_head_matches(repo.path())?;
 		commit(repo.path(), "two")?;
-		let after: String = assert_head_matches(repo.path())?;
+		let after: OidHex = assert_head_matches(repo.path())?;
 		assert_ne!(before, after);
-		assert_eq!(git(repo.path(), &["rev-parse", "HEAD~1"])?, before);
+		assert_eq!(git(repo.path(), &["rev-parse", "HEAD~1"])?, before.as_str());
 		return Ok(());
 	}
 
@@ -198,10 +227,10 @@ mod tests {
 		commit(&wt, "on side")?;
 		assert!(wt.join(".git").is_file());
 		assert_git_dir_matches(&wt)?;
-		let side: String = assert_head_matches(&wt)?;
-		let main: String = assert_head_matches(repo.path())?;
+		let side: OidHex = assert_head_matches(&wt)?;
+		let main: OidHex = assert_head_matches(repo.path())?;
 		assert_ne!(side, main);
-		let linked: PathBuf = read_git_dir(&wt).map_err(|err| format!("read_git_dir(&wt): {err:?}"))?;
+		let linked: PathBuf = ok(read_git_dir(&wt), "read_git_dir(&wt)")?;
 		assert!(same_dir(&linked, &repo.path().join(".git").join("worktrees").join("wt"))?);
 		return Ok(());
 	}
@@ -218,11 +247,11 @@ mod tests {
 	#[test]
 	fn detached_head_is_read_directly() -> Result<(), String> {
 		let repo: TempDir = committed_repo()?;
-		let first: String = git(repo.path(), &["rev-parse", "HEAD"])?;
+		let first: OidHex = rev(repo.path(), "HEAD")?;
 		commit(repo.path(), "two")?;
-		git(repo.path(), &["switch", "--detach", &first])?;
-		let head_file: String = fs::read_to_string(repo.path().join(".git/HEAD")).map_err(|err| format!("read .git/HEAD: {err:?}"))?;
-		assert_eq!(head_file.trim(), first);
+		git(repo.path(), &["switch", "--detach", first.as_str()])?;
+		let head_file: String = ok(fs::read_to_string(repo.path().join(".git/HEAD")), "read .git/HEAD")?;
+		assert_eq!(head_file.trim(), first.as_str());
 		assert_eq!(assert_head_matches(repo.path())?, first);
 		return Ok(());
 	}
@@ -253,8 +282,8 @@ mod tests {
 	#[test]
 	fn a_stray_reftable_dir_is_ignored_like_git_does() -> Result<(), String> {
 		let repo: TempDir = committed_repo()?;
-		let before: String = assert_head_matches(repo.path())?;
-		fs::create_dir(repo.path().join(".git/reftable")).map_err(|err| format!("create .git/reftable: {err:?}"))?;
+		let before: OidHex = assert_head_matches(repo.path())?;
+		ok(fs::create_dir(repo.path().join(".git/reftable")), "create .git/reftable")?;
 		assert_eq!(assert_head_matches(repo.path())?, before);
 		return Ok(());
 	}
@@ -264,9 +293,9 @@ mod tests {
 	fn read_head_reports_a_missing_or_directory_head_as_no_head() -> Result<(), String> {
 		let repo: TempDir = committed_repo()?;
 		let head: PathBuf = repo.path().join(".git/HEAD");
-		fs::remove_file(&head).map_err(|err| format!("remove HEAD: {err:?}"))?;
+		ok(fs::remove_file(&head), "remove HEAD")?;
 		assert_eq!(expect_err(read_head(repo.path()), "read_head(no HEAD)")?, Miss::new(&head, MissReason::NoHead));
-		fs::create_dir(&head).map_err(|err| format!("mkdir HEAD: {err:?}"))?;
+		ok(fs::create_dir(&head), "mkdir HEAD")?;
 		assert_eq!(expect_err(read_head(repo.path()), "read_head(HEAD dir)")?, Miss::new(&head, MissReason::NoHead));
 		return Ok(());
 	}
@@ -275,8 +304,8 @@ mod tests {
 	fn ref_storage_config_falls_back() -> Result<(), String> {
 		let repo: TempDir = committed_repo()?;
 		let config: PathBuf = repo.path().join(".git/config");
-		let text: String = fs::read_to_string(&config).map_err(|err| format!("read config: {err:?}"))?;
-		fs::write(&config, format!("{text}[extensions]\n\trefStorage = files\n")).map_err(|err| format!("write config: {err:?}"))?;
+		let text: String = ok(fs::read_to_string(&config), "read config")?;
+		ok(fs::write(&config, format!("{text}[extensions]\n\trefStorage = files\n")), "write config")?;
 		assert_eq!(expect_err(read_head(repo.path()), "read_head")?.reason, MissReason::Reftable);
 		return Ok(());
 	}
@@ -285,11 +314,11 @@ mod tests {
 	fn malformed_loose_ref_falls_back_to_git() -> Result<(), String> {
 		let repo: TempDir = committed_repo()?;
 		let loose: PathBuf = repo.path().join(".git/refs/heads/main");
-		let oid: String = fs::read_to_string(&loose).map_err(|err| format!("read loose ref: {err:?}"))?;
-		fs::write(&loose, oid.trim().to_uppercase()).map_err(|err| format!("write loose ref: {err:?}"))?;
+		let oid: String = ok(fs::read_to_string(&loose), "read loose ref")?;
+		ok(fs::write(&loose, oid.trim().to_uppercase()), "write loose ref")?;
 		let miss: Miss = assert_head_falls_back(repo.path(), MissReason::Malformed)?;
 		assert!(miss.path.ends_with("refs/heads/main"));
-		assert_eq!(head(repo.path(), GitEnv::NONE).map_err(|err| format!("head: {err:?}"))?.as_str(), oid.trim());
+		assert_eq!(ok(head(repo.path(), GitEnv::NONE), "head")?.as_str(), oid.trim());
 		return Ok(());
 	}
 
@@ -298,11 +327,11 @@ mod tests {
 	fn a_loose_ref_longer_than_the_read_buffer_falls_back_to_git() -> Result<(), String> {
 		let repo: TempDir = committed_repo()?;
 		let loose: PathBuf = repo.path().join(".git/refs/heads/main");
-		let oid: String = fs::read_to_string(&loose).map_err(|err| format!("read loose ref: {err:?}"))?;
+		let oid: String = ok(fs::read_to_string(&loose), "read loose ref")?;
 		let padded: String = format!("{}\n{}", oid.trim(), " ".repeat(SMALL_FILE_MAX));
-		fs::write(&loose, padded).map_err(|err| format!("write loose ref: {err:?}"))?;
+		ok(fs::write(&loose, padded), "write loose ref")?;
 		assert_head_falls_back(repo.path(), MissReason::Io(ErrorKind::FileTooLarge))?;
-		assert_eq!(head(repo.path(), GitEnv::NONE).map_err(|err| format!("head: {err:?}"))?.as_str(), oid.trim());
+		assert_eq!(ok(head(repo.path(), GitEnv::NONE), "head")?.as_str(), oid.trim());
 		return Ok(());
 	}
 
@@ -311,10 +340,10 @@ mod tests {
 		let root: TempDir = new_repo()?;
 		let work: PathBuf = root.path().join("work");
 		let store: PathBuf = root.path().join("store");
-		fs::create_dir_all(&work).map_err(|err| format!("create work: {err:?}"))?;
-		fs::create_dir_all(&store).map_err(|err| format!("create store: {err:?}"))?;
+		ok(fs::create_dir_all(&work), "create work")?;
+		ok(fs::create_dir_all(&store), "create store")?;
 		git(&work, &["init", "-q", "-b", "main", "--separate-git-dir", utf8(&store.join("repo.git"))?])?;
-		fs::write(work.join(".git"), "gitdir: ../store/repo.git\n").map_err(|err| format!("write gitfile: {err:?}"))?;
+		ok(fs::write(work.join(".git"), "gitdir: ../store/repo.git\n"), "write gitfile")?;
 		commit(&work, "one")?;
 		assert_git_dir_matches(&work)?;
 		assert_head_matches(&work)?;
@@ -327,7 +356,7 @@ mod tests {
 		let bare: PathBuf = repo.path().join("inner.git");
 		git(repo.path(), &["init", "-q", "--bare", utf8(&bare)?])?;
 		assert_eq!(expect_err(read_git_dir(&bare), "read_git_dir")?.reason, MissReason::BareCandidate);
-		let slow: PathBuf = git_dir(&bare, GitEnv::NONE).map_err(|err| format!("git_dir(&bare): {err:?}"))?;
+		let slow: PathBuf = ok(git_dir(&bare, GitEnv::NONE), "git_dir(&bare)")?;
 		assert!(same_dir(&slow, &bare)?);
 		return Ok(());
 	}
@@ -335,7 +364,7 @@ mod tests {
 	// With no `.git` or `HEAD` in any ancestor both refuse, and the error relays git's own words.
 	#[test]
 	fn outside_any_repo_the_reader_and_git_both_refuse() -> Result<(), String> {
-		let dir: TempDir = tempdir().map_err(|err| format!("tempdir(): {err:?}"))?;
+		let dir: TempDir = ok(tempdir(), "tempdir()")?;
 		let git_stderr: String = git_fails(dir.path(), &["rev-parse", "--absolute-git-dir"])?;
 		assert!(git_stderr.contains("not a git repository"), "{git_stderr}");
 		assert_eq!(expect_err(read_git_dir(dir.path()), "read_git_dir")?, Miss::new(dir.path(), MissReason::NotARepo));
@@ -364,13 +393,13 @@ mod tests {
 		let there_git: PathBuf = there.path().join(".git");
 		let vars: [(&str, &OsStr); 1] = [("GIT_DIR", there_git.as_os_str())];
 		let redirected: GitEnv<'_> = GitEnv::new(&vars);
-		let without: PathBuf = git_dir(here.path(), GitEnv::NONE).map_err(|err| format!("git_dir: {err}"))?;
-		let with: PathBuf = git_dir(here.path(), redirected).map_err(|err| format!("git_dir(GIT_DIR): {err}"))?;
+		let without: PathBuf = ok(git_dir(here.path(), GitEnv::NONE), "git_dir")?;
+		let with: PathBuf = ok(git_dir(here.path(), redirected), "git_dir(GIT_DIR)")?;
 		assert!(same_dir(&without, &here.path().join(".git"))? && same_dir(&with, &there_git)?, "{with:?}");
 		assert!(!same_dir(&with, &without)?);
-		let head_with: OidHex = head(here.path(), redirected).map_err(|err| format!("head(GIT_DIR): {err}"))?;
+		let head_with: OidHex = ok(head(here.path(), redirected), "head(GIT_DIR)")?;
 		assert_eq!(head_with.as_str(), git(there.path(), &["rev-parse", "HEAD"])?);
-		assert_ne!(head_with, head(here.path(), GitEnv::NONE).map_err(|err| format!("head: {err}"))?);
+		assert_ne!(head_with, ok(head(here.path(), GitEnv::NONE), "head")?);
 		let gone: PathBuf = here.path().join("no-such.git");
 		let bad: [(&str, &OsStr); 1] = [("GIT_DIR", gone.as_os_str())];
 		let err: Error = expect_err(git_dir(here.path(), GitEnv::new(&bad)), "git_dir(bad GIT_DIR)")?;
@@ -436,8 +465,8 @@ mod tests {
 	#[test]
 	fn git_with_non_utf8_stdout_returns_an_err() -> Result<(), String> {
 		let repo = new_repo()?;
-		let mut config = OpenOptions::new().append(true).open(repo.path().join(".git/config")).map_err(|e| format!("open config: {e}"))?;
-		config.write_all(b"[probe]\n\tvalue = caf\xe9\n").map_err(|e| format!("append config: {e}"))?;
+		let mut config = ok(OpenOptions::new().append(true).open(repo.path().join(".git/config")), "open config")?;
+		ok(config.write_all(b"[probe]\n\tvalue = caf\xe9\n"), "append config")?;
 		drop(config);
 		let got = git(repo.path(), &["config", "probe.value"]);
 		assert!(matches!(&got, Err(text) if text.starts_with("String::from_utf8(out.stdout)")), "{got:?}");
@@ -453,6 +482,12 @@ mod tests {
 		assert!(same_dir(&root.join("gone"), root).is_err());
 		assert!(same_dir(root, &root.join("gone")).is_err());
 		return Ok(());
+	}
+
+	#[test]
+	fn ok_passes_a_value_through_and_names_the_step_on_an_error() {
+		assert_eq!(ok(Ok::<u8, &str>(7), "step"), Ok(7));
+		assert_eq!(ok(Err::<u8, &str>("boom"), "step"), Err("step: boom".to_owned()));
 	}
 
 	#[test]

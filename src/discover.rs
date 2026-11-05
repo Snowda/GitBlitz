@@ -214,7 +214,7 @@ mod tests {
 		let repo = new_repo()?;
 		let miss = expect_err(read_git_dir(&repo.path().join(".git").join("refs")), "read_git_dir(.git/refs)")?;
 		assert_eq!(miss.reason, MissReason::BareCandidate);
-		let got_parent: &Path = miss.path.parent().ok_or_else(|| String::from("miss.path.parent() is None"))?;
+		let got_parent: &Path = miss.path.parent().ok_or("miss.path.parent() is None")?;
 		assert!(same_dir(got_parent, &repo.path().join(".git"))?);
 		return Ok(());
 	}

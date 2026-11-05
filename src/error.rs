@@ -27,6 +27,14 @@ pub enum MissReason {
 	NestedRepo,
 	/// A SHA-256 repository: its index entries are wider than this reader parses.
 	ObjectFormat,
+	MissingObject,
+	Alternates,
+	ReplaceRefs,
+	UnsupportedPack,
+	DeltaChain,
+	/// A path `ls-tree` would read as a pattern, normalise, or match together with another path.
+	Pathspec,
+	NotATree,
 	Io(ErrorKind),
 }
 
@@ -70,4 +78,6 @@ pub enum Cause {
 	NotUtf8,
 	#[error("printed {len} bytes, more than the {max} hex digits of an object id", len = .0, max = crate::OID_HEX_MAX)]
 	NotAnOid(usize),
+	#[error("printed output GitBlitz does not parse: {0}")]
+	Unparsed(String),
 }

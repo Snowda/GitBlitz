@@ -8,12 +8,14 @@ mod payload;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 
-use gitblitz::{GitEnv, OidHex};
+use gitblitz::GitEnv;
 use hook::{Flag, Verdict};
+use payload::WrongType;
 use serde_json::Value;
 
 const USAGE: &str = "usage: gitblitz <git-dir|head> [DIR] \
@@ -51,8 +53,36 @@ impl Key {
 	}
 }
 
-/// One `--key value` option, its value borrowed from the args.
-type Pair<'a> = (Key, &'a OsStr);
+fn key_of(word: &OsStr) -> Option<Key> {
+	return Key::parse(word.to_str()?);
+}
+
+/// The values given for one key, in order, borrowed from the `--key value` pairs of the args.
+#[derive(Clone, Copy)]
+struct Values<'a> {
+	pairs: &'a [[OsString; 2]],
+	key: Key,
+}
+
+impl<'a> Values<'a> {
+	fn iter(self) -> impl Iterator<Item = &'a OsStr> + Clone {
+		return self.pairs.iter().filter(move |[key, _]| return key_of(key) == Some(self.key)).map(|[_, value]| return value.as_os_str());
+	}
+}
+
+impl PartialEq for Values<'_> {
+	fn eq(&self, other: &Self) -> bool {
+		return self.iter().eq(other.iter());
+	}
+}
+
+impl Eq for Values<'_> {}
+
+impl Debug for Values<'_> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+		return f.debug_list().entries(self.iter()).finish();
+	}
+}
 
 /// How the process exits; `Gated` carries the gated command's own code through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,11 +132,11 @@ enum Source<'a> {
 }
 
 /// The edit-marker commands, with the caller's marker name, rules and inputs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HookAction<'a> {
-	Mark { flag: Flag<'a>, suffixes: Vec<&'a str>, path: Source<'a> },
+	Mark { flag: Flag<'a>, suffixes: Values<'a>, path: Source<'a> },
 	Clear { flag: Flag<'a> },
-	Gate { flag: Flag<'a>, required: Vec<&'a Path>, skip_if: Option<&'a str>, program: &'a OsStr, args: &'a [OsString] },
+	Gate { flag: Flag<'a>, required: Values<'a>, skip_if: Option<&'a str>, program: &'a OsStr, args: &'a [OsString] },
 }
 
 impl HookAction<'_> {
@@ -138,7 +168,7 @@ fn parse<'a>(args: &'a [OsString]) -> Option<Cli<'a>> {
 fn parse_mark(args: &[OsString]) -> Option<(Source<'_>, HookAction<'_>)> {
 	let accepted: [Key; 6] = [Key::Flag, Key::Suffix, Key::Dir, Key::DirFrom, Key::Path, Key::PathFrom];
 	let options: Options<'_> = Options::parse(args, &accepted).filter(|options: &Options<'_>| return options.tail.is_empty())?;
-	let suffixes: Vec<&str> = options.all(Key::Suffix).into_iter().map(OsStr::to_str).collect::<Option<_>>()?;
+	let suffixes: Values<'_> = Some(options.all(Key::Suffix)).filter(|all| return all.iter().all(|s| return s.to_str().is_some()))?;
 	let action = HookAction::Mark { flag: options.flag()?, suffixes, path: options.source(Key::Path, Key::PathFrom)? };
 	return Some((options.source(Key::Dir, Key::DirFrom)?, action));
 }
@@ -159,7 +189,7 @@ fn parse_gate(args: &[OsString]) -> Option<(Source<'_>, HookAction<'_>)> {
 		None => None,
 		Some(value) => Some(pointer(value)?),
 	};
-	let required: Vec<&Path> = options.all(Key::RequireFile).into_iter().map(Path::new).collect();
+	let required: Values<'_> = options.all(Key::RequireFile);
 	let action = HookAction::Gate { flag: options.flag()?, required, skip_if, program, args };
 	return Some((options.source(Key::Dir, Key::DirFrom)?, action));
 }
@@ -170,37 +200,42 @@ fn pointer(value: &OsStr) -> Option<&str> {
 }
 
 /// A hook command's `--key value` options, each key one the command accepts, and the words from `--` on.
+#[derive(Clone, Copy)]
 struct Options<'a> {
-	pairs: Vec<Pair<'a>>,
+	pairs: &'a [[OsString; 2]],
 	tail: &'a [OsString],
 }
 
 impl<'a> Options<'a> {
+	// `None` on an unknown key or a lone or `--` value: the words before the first `--` must pair up.
 	fn parse(args: &'a [OsString], accepted: &[Key]) -> Option<Self> {
-		let (pairs, tail) = key_values(args)?;
-		let known: bool = pairs.iter().all(|&(key, _): &Pair<'_>| return accepted.contains(&key));
+		let (pairs, tail) = args.split_at(args.iter().position(|word: &OsString| return word == "--").unwrap_or(args.len()));
+		let (pairs, []) = pairs.as_chunks::<2>() else {
+			return None;
+		};
+		let known: bool = pairs.iter().all(|[key, _]| return key_of(key).is_some_and(|key: Key| return accepted.contains(&key)));
 		return known.then_some(Self { pairs, tail });
 	}
 
-	fn all(&self, wanted: Key) -> Vec<&'a OsStr> {
-		return self.pairs.iter().filter(|&&(key, _)| return key == wanted).map(|&(_, value)| return value).collect();
+	const fn all(self, wanted: Key) -> Values<'a> {
+		return Values { pairs: self.pairs, key: wanted };
 	}
 
 	// `Some(None)` when absent, `None` (bad usage) when given more than once.
-	fn at_most_one(&self, wanted: Key) -> Option<Option<&'a OsStr>> {
-		return match self.all(wanted)[..] {
-			[] => Some(None),
-			[value] => Some(Some(value)),
+	fn at_most_one(self, wanted: Key) -> Option<Option<&'a OsStr>> {
+		let mut found = self.all(wanted).iter();
+		return match (found.next(), found.next()) {
+			(value, None) => Some(value),
 			_ => None,
 		};
 	}
 
-	fn flag(&self) -> Option<Flag<'a>> {
+	fn flag(self) -> Option<Flag<'a>> {
 		return Flag::new(self.at_most_one(Key::Flag)??);
 	}
 
 	// An input given as `arg`, as a payload field `from`, or not at all; both at once is bad usage.
-	fn source(&self, arg: Key, from: Key) -> Option<Source<'a>> {
+	fn source(self, arg: Key, from: Key) -> Option<Source<'a>> {
 		return match (self.at_most_one(arg)?, self.at_most_one(from)?) {
 			(None, None) => Some(Source::Unset),
 			(Some(value), None) => Some(Source::Arg(value)),
@@ -210,30 +245,13 @@ impl<'a> Options<'a> {
 	}
 }
 
-// `--key value` pairs up to a `--` or the end, and the rest from that `--`; `None` on an unknown key or a lone
-// or `--` value.
-fn key_values(mut rest: &[OsString]) -> Option<(Vec<Pair<'_>>, &[OsString])> {
-	let mut pairs: Vec<Pair<'_>> = Vec::new();
-	loop {
-		match rest {
-			[] => return Some((pairs, rest)),
-			[dash, ..] if dash == "--" => return Some((pairs, rest)),
-			[key, value, tail @ ..] if value != "--" => {
-				pairs.push((Key::parse(key.to_str()?)?, value));
-				rest = tail;
-			}
-			_ => return None,
-		}
-	}
-}
-
 fn run(args: &[OsString], stdin: &mut impl Read, out: &mut impl Write, err: &mut impl Write) -> Exit {
 	let Some(cli) = parse(args) else {
 		return emit(err, USAGE, Exit::Usage);
 	};
 	let cwd: PathBuf = match env::current_dir() {
 		Ok(cwd) => cwd,
-		Err(e) => return emit(err, &format!("gitblitz: reading the cwd: {e}"), Exit::Failure),
+		Err(e) => return emit(err, format!("gitblitz: reading the cwd: {e}"), Exit::Failure),
 	};
 	return match cli {
 		Cli::Query(query, dir) => answer(query, dir.unwrap_or(&cwd), out, err),
@@ -246,19 +264,19 @@ fn hook(dir: Source<'_>, action: HookAction<'_>, cwd: &Path, stdin: &mut impl Re
 	let payload: Value = if matches!(dir, Source::Field(_)) || action.reads_payload() {
 		match payload::read(stdin) {
 			Ok(payload) => payload,
-			Err(e) => return emit(err, &format!("gitblitz: reading the hook payload: {e}"), Exit::Failure),
+			Err(e) => return emit(err, format!("gitblitz: reading the hook payload: {e}"), Exit::Failure),
 		}
 	} else {
 		Value::Null
 	};
 	return match resolve(dir, &payload) {
 		Ok(dir) => on_hook(action, dir.map_or(cwd, Path::new), &payload, err),
-		Err(e) => emit(err, &format!("gitblitz: {e}"), Exit::Failure),
+		Err(e) => emit(err, format!("gitblitz: {e}"), Exit::Failure),
 	};
 }
 
 // The input's value; a field that is absent or `null` in the payload is unset.
-fn resolve<'v>(source: Source<'v>, payload: &'v Value) -> Result<Option<&'v OsStr>, String> {
+fn resolve<'v>(source: Source<'v>, payload: &'v Value) -> Result<Option<&'v OsStr>, WrongType<'v>> {
 	return match source {
 		Source::Unset => Ok(None),
 		Source::Arg(value) => Ok(Some(value)),
@@ -268,37 +286,41 @@ fn resolve<'v>(source: Source<'v>, payload: &'v Value) -> Result<Option<&'v OsSt
 
 // The CLI sets no git variables: it answers for the repo found on disk from `dir`.
 fn answer(query: Query, dir: &Path, out: &mut impl Write, err: &mut impl Write) -> Exit {
-	let answer: Result<String, gitblitz::Error> = match query {
-		Query::GitDir => gitblitz::git_dir(dir, GitEnv::NONE).map(|path: PathBuf| return path.display().to_string()),
-		Query::Head => gitblitz::head(dir, GitEnv::NONE).map(|oid: OidHex| return oid.as_str().to_owned()),
+	return match query {
+		Query::GitDir => reply(gitblitz::git_dir(dir, GitEnv::NONE).as_deref().map(Path::display), out, err),
+		Query::Head => reply(gitblitz::head(dir, GitEnv::NONE), out, err),
 	};
+}
+
+// The answer on `out`, or why it failed on `err`.
+fn reply(answer: Result<impl Display, impl Display>, out: &mut impl Write, err: &mut impl Write) -> Exit {
 	return match answer {
-		Ok(text) => emit(out, &text, Exit::Success),
-		Err(e) => emit(err, &format!("gitblitz: {e}"), Exit::Failure),
+		Ok(text) => emit(out, text, Exit::Success),
+		Err(e) => emit(err, format!("gitblitz: {e}"), Exit::Failure),
 	};
 }
 
 fn on_hook(action: HookAction<'_>, dir: &Path, payload: &Value, err: &mut impl Write) -> Exit {
 	let done: Result<(), io::Error> = match action {
 		HookAction::Mark { flag, suffixes, path } => match resolve(path, payload) {
-			Ok(edited) => hook::mark(dir, edited, flag, &suffixes).map(drop),
-			Err(e) => return emit(err, &format!("gitblitz: {e}"), Exit::Failure),
+			Ok(edited) => hook::mark(dir, edited, flag, suffixes.iter()).map(drop),
+			Err(e) => return emit(err, format!("gitblitz: {e}"), Exit::Failure),
 		},
 		HookAction::Clear { flag } => hook::clear(dir, flag).map(drop),
 		HookAction::Gate { flag, required, skip_if, program, args } => {
 			return match skip_if.map_or(Ok(false), |field: &str| return payload::truth(payload, field)) {
 				Ok(true) => Exit::Success,
-				Ok(false) => match hook::gate(dir, flag, &required) {
+				Ok(false) => match hook::gate(dir, flag, required.iter()) {
 					Verdict::Run => run_gated(program, args, dir, err),
 					Verdict::Skip(_) => Exit::Success,
 				},
-				Err(e) => emit(err, &format!("gitblitz: {e}"), Exit::Failure),
+				Err(e) => emit(err, format!("gitblitz: {e}"), Exit::Failure),
 			};
 		}
 	};
 	return match done {
 		Ok(()) => Exit::Success,
-		Err(e) => emit(err, &format!("gitblitz: updating the edit marker in {}: {e}", dir.display()), Exit::Failure),
+		Err(e) => emit(err, format!("gitblitz: updating the edit marker in {}: {e}", dir.display()), Exit::Failure),
 	};
 }
 
@@ -309,11 +331,11 @@ fn run_gated(program: &OsStr, args: &[OsString], dir: &Path, err: &mut impl Writ
 	return match spawned {
 		Ok(status) => status.code().and_then(|code: i32| return u8::try_from(code).ok()).map_or(Exit::Failure, Exit::Gated),
 		Err(e) if e.kind() == io::ErrorKind::NotFound => Exit::Success,
-		Err(e) => emit(err, &format!("gitblitz: starting {}: {e}", Path::new(program).display()), Exit::Failure),
+		Err(e) => emit(err, format!("gitblitz: starting {}: {e}", Path::new(program).display()), Exit::Failure),
 	};
 }
 
-fn emit(sink: &mut impl Write, line: &str, exit: Exit) -> Exit {
+fn emit(sink: &mut impl Write, line: impl Display, exit: Exit) -> Exit {
 	return match writeln!(sink, "{line}") {
 		Ok(()) => exit,
 		Err(_) => Exit::Failure,
@@ -337,7 +359,7 @@ mod tests {
 	use tempfile::TempDir;
 
 	use super::hook::Flag;
-	use super::{parse, run, Cli, Exit, HookAction, Query, Source, USAGE};
+	use super::{parse, run, Cli, Exit, HookAction, Key, Query, Source, Values, USAGE};
 
 	// One caller's schema (Claude Code's hook payload); nothing outside these args knows it.
 	const NAME: &str = "test-edit-flag";
@@ -396,6 +418,11 @@ mod tests {
 		));
 	}
 
+	// A call's exit code, stdout and stderr, borrowed so an assert compares them with literals.
+	fn shown(got: &(Exit, String, String)) -> (Exit, &str, &str) {
+		return (got.0, &got.1, &got.2);
+	}
+
 	fn call(args: &[&str]) -> Result<(Exit, String, String), String> {
 		let got_call_with = match call_with(args, "") {
 			Ok(value) => value,
@@ -421,13 +448,8 @@ mod tests {
 			Ok(_) => {}
 			Err(err) => return Err(format!("fs::create_dir(&sub): {err:?}")),
 		};
-		let (code, out, err) = match call(&[
-			"git-dir",
-			match sub.to_str() {
-				Some(value) => value,
-				None => return Err(String::from("sub.to_str() is None")),
-			},
-		]) {
+		let sub_arg: &str = sub.to_str().ok_or("sub.to_str() is None")?;
+		let (code, out, err) = match call(&["git-dir", sub_arg]) {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call: {err}")),
 		};
@@ -451,13 +473,8 @@ mod tests {
 			Ok(value) => value,
 			Err(err) => return Err(format!("git_init: {err}")),
 		};
-		let (code, out, err) = match call(&[
-			"head",
-			match repo.path().to_str() {
-				Some(value) => value,
-				None => return Err(String::from("repo.path().to_str() is None")),
-			},
-		]) {
+		let dir: &str = repo.path().to_str().ok_or("repo.path().to_str() is None")?;
+		let (code, out, err) = match call(&["head", dir]) {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call: {err}")),
 		};
@@ -479,28 +496,25 @@ mod tests {
 			Ok(value) => value,
 			Err(err) => return Err(format!("git commit: {err:?}")),
 		};
-		assert!(committed.status.success(), "{}", String::from_utf8_lossy(&committed.stderr));
+		assert!(committed.status.success(), "{}", committed.stderr.escape_ascii());
 		let truth: Output = match Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repo.path()).output() {
 			Ok(value) => value,
 			Err(err) => return Err(format!("git rev-parse: {err:?}")),
 		};
-		let dir: &str = match repo.path().to_str() {
-			Some(value) => value,
-			None => return Err(String::from("repo.path().to_str() is None")),
-		};
+		let dir: &str = repo.path().to_str().ok_or("repo.path().to_str() is None")?;
 		let (code, out, err) = match call(&["head", dir]) {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call: {err}")),
 		};
 		assert_eq!((code, err.as_str()), (Exit::Success, ""));
-		assert_eq!(out, String::from_utf8_lossy(&truth.stdout).replace("\r\n", "\n"));
+		assert_eq!(out, str::from_utf8(&truth.stdout).map_err(|e| e.to_string())?.replace("\r\n", "\n"));
 		assert_eq!(out.len(), 41, "{out:?}");
 		return Ok(());
 	}
 
 	#[test]
 	fn bad_usage_prints_usage() -> Result<(), String> {
-		let cases: [&[&str]; 32] = [
+		let cases: [&[&str]; 33] = [
 			&[],
 			&["nope"],
 			&["head", "a", "b"],
@@ -515,6 +529,7 @@ mod tests {
 			&["hook", "mark", "--flag", "a", "--require-file", "Cargo.toml"],
 			&["hook", "mark", "--flag", "a", "--skip-if", "/x"],
 			&["hook", "mark", "--flag", "a", "--nope", "x"],
+			&["hook", "mark", "--flag", "a", "--suffix"],
 			&["gate", "--flag", "a", "--FLAG", "b", "--", "x"],
 			&["hook", "mark", "--flag", "a", "--dir", "d", "--dir-from", "/cwd"],
 			&["hook", "mark", "--flag", "a", "--dir", "d", "--dir", "e"],
@@ -534,12 +549,13 @@ mod tests {
 			&["gate", "--flag", "a", "--skip-if", "/a", "--skip-if", "/b", "--", "x"],
 			&["gate", "--flag", "a", "--dir-from", "/cwd", "--dir", "d", "--", "x"],
 		];
+		let usage: &str = &format!("{USAGE}\n");
 		return cases.iter().try_for_each(|args: &&[&str]| -> Result<(), String> {
 			let got = match call(args) {
 				Ok(value) => value,
 				Err(err) => return Err(format!("call {args:?}: {err}")),
 			};
-			assert_eq!(got, (Exit::Usage, String::new(), format!("{USAGE}\n")), "{args:?}");
+			assert_eq!(shown(&got), (Exit::Usage, "", usage), "{args:?}");
 			return Ok(());
 		});
 	}
@@ -561,7 +577,7 @@ mod tests {
 			let args: Vec<OsString> = args.iter().map(OsString::from).collect();
 			let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
 			let code: Exit = run(&args, &mut Unreadable, &mut out, &mut err);
-			assert_eq!((code, String::from_utf8_lossy(&err).into_owned()), (Exit::Usage, format!("{USAGE}\n")), "{args:?}");
+			assert_eq!((code, str::from_utf8(&err)), (Exit::Usage, Ok(format!("{USAGE}\n").as_str())), "{args:?}");
 		});
 	}
 
@@ -569,26 +585,30 @@ mod tests {
 	fn parse_maps_each_form_to_its_command() -> Result<(), String> {
 		let args = |words: &[&str]| -> Vec<OsString> { return words.iter().map(OsString::from).collect() };
 		let (head, gate): (Vec<OsString>, Vec<OsString>) = (args(&["head", "d"]), args(&gate_args(&["git", "x", "y"])));
-		let flag: Flag<'_> = Flag::new(OsStr::new(NAME)).ok_or_else(|| String::from("NAME is a valid flag"))?;
+		let flag: Flag<'_> = Flag::new(OsStr::new(NAME)).ok_or("NAME is a valid flag")?;
 		let cwd: Source<'_> = Source::Field("/cwd");
 		assert_eq!(parse(&args(&["git-dir"])), Some(Cli::Query(Query::GitDir, None)));
 		assert_eq!(parse(&head), Some(Cli::Query(Query::Head, Some(Path::new("d")))));
-		let marked = HookAction::Mark { flag, suffixes: vec![".rs", ".toml"], path: Source::Field("/tool_input/file_path") };
+		let pair = |key: &str, value: &str| -> [OsString; 2] { return [OsString::from(key), OsString::from(value)] };
+		let (suffix_pairs, required_pairs) = ([pair("--suffix", ".rs"), pair("--suffix", ".toml")], [pair("--require-file", "Cargo.toml")]);
+		let suffixes: Values<'_> = Values { pairs: &suffix_pairs, key: Key::Suffix };
+		let (no_suffixes, no_required) = (Values { pairs: &[], key: Key::Suffix }, Values { pairs: &[], key: Key::RequireFile });
+		let marked = HookAction::Mark { flag, suffixes, path: Source::Field("/tool_input/file_path") };
 		assert_eq!(parse(&args(&MARK)), Some(Cli::Hook(cwd, marked)));
 		let plain: Vec<OsString> = args(&["hook", "mark", "--path", "a.rs", "--flag", NAME, "--dir", "d"]);
-		let plain_mark = HookAction::Mark { flag, suffixes: vec![], path: Source::Arg(OsStr::new("a.rs")) };
+		let plain_mark = HookAction::Mark { flag, suffixes: no_suffixes, path: Source::Arg(OsStr::new("a.rs")) };
 		assert_eq!(parse(&plain), Some(Cli::Hook(Source::Arg(OsStr::new("d")), plain_mark)));
 		assert_eq!(parse(&args(&CLEAR)), Some(Cli::Hook(cwd, HookAction::Clear { flag })));
 		let gated = HookAction::Gate {
 			flag,
-			required: vec![Path::new("Cargo.toml")],
+			required: Values { pairs: &required_pairs, key: Key::RequireFile },
 			skip_if: Some("/stop_hook_active"),
 			program: OsStr::new("git"),
 			args: &gate[11..],
 		};
 		assert_eq!(parse(&gate), Some(Cli::Hook(cwd, gated)));
 		let bare: Vec<OsString> = args(&["gate", "--flag", NAME, "--", "git"]);
-		let ungated = HookAction::Gate { flag, required: vec![], skip_if: None, program: OsStr::new("git"), args: &[] };
+		let ungated = HookAction::Gate { flag, required: no_required, skip_if: None, program: OsStr::new("git"), args: &[] };
 		assert_eq!(parse(&bare), Some(Cli::Hook(Source::Unset, ungated)));
 		return Ok(());
 	}
@@ -612,7 +632,7 @@ mod tests {
 		let stop: String = payload(repo.path(), "");
 		let failing_gate: Vec<&str> = gate_args(&["git", "rev-parse", "--verify", "no-such-ref"]);
 		assert_eq!(call_with(&failing_gate, &stop)?.0, Exit::Success, "skipped before any edit");
-		assert_eq!(call_with(&MARK, &edit)?, (Exit::Success, String::new(), String::new()));
+		assert_eq!(shown(&call_with(&MARK, &edit)?), (Exit::Success, "", ""));
 		assert!(repo.path().join(".git").join(NAME).is_file());
 		assert_eq!(call_with(&failing_gate, &stop)?.0, Exit::Gated(128), "ran and passed git's exit code through");
 		assert_eq!(call_with(&gate_args(&["git", "--version"]), &stop)?.0, Exit::Gated(0), "ran, not skipped");
@@ -664,7 +684,7 @@ mod tests {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call_with: {err}")),
 		};
-		assert_eq!(got_call_with_8, (Exit::Success, String::new(), String::new()));
+		assert_eq!(shown(&got_call_with_8), (Exit::Success, "", ""));
 		return Ok(());
 	}
 
@@ -679,7 +699,7 @@ mod tests {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call_with: {err}")),
 		};
-		assert_eq!(got_call_with_9, (Exit::Success, String::new(), String::new()));
+		assert_eq!(shown(&got_call_with_9), (Exit::Success, "", ""));
 		assert!(repo.path().join(".git").join(NAME).is_file());
 		return Ok(());
 	}
@@ -700,21 +720,24 @@ mod tests {
 	fn plain_arguments_never_read_stdin() -> Result<(), String> {
 		let repo: TempDir = git_init()?;
 		let dir: &str = utf8(repo.path())?;
-		let call_unreadable = |words: &[&str]| -> (Exit, String) {
+		// Each call must leave stderr empty; the exit code is what the asserts compare.
+		let call_unreadable = |words: &[&str]| -> Exit {
 			let args: Vec<OsString> = words.iter().map(OsString::from).collect();
 			let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
-			return (run(&args, &mut Unreadable, &mut out, &mut err), String::from_utf8_lossy(&err).into_owned());
+			let code: Exit = run(&args, &mut Unreadable, &mut out, &mut err);
+			assert!(err.is_empty(), "{words:?}: {}", err.escape_ascii());
+			return code;
 		};
 		let mark: [&str; 9] = ["hook", "mark", "--flag", NAME, "--suffix", ".rs", "--dir", dir, "--path"];
-		assert_eq!(call_unreadable(&[&mark[..], &["README.md"]].concat()), (Exit::Success, String::new()));
+		assert_eq!(call_unreadable(&[&mark[..], &["README.md"]].concat()), Exit::Success);
 		assert!(!repo.path().join(".git").join(NAME).exists(), "README.md has no listed suffix");
-		assert_eq!(call_unreadable(&[&mark[..], &["src/a.rs"]].concat()), (Exit::Success, String::new()));
+		assert_eq!(call_unreadable(&[&mark[..], &["src/a.rs"]].concat()), Exit::Success);
 		assert!(repo.path().join(".git").join(NAME).is_file());
 		let gate: [&str; 8] = ["gate", "--flag", NAME, "--dir", dir, "--", "git", "--version"];
-		assert_eq!(call_unreadable(&gate), (Exit::Gated(0), String::new()));
-		assert_eq!(call_unreadable(&["hook", "clear", "--flag", NAME, "--dir", dir]), (Exit::Success, String::new()));
+		assert_eq!(call_unreadable(&gate), Exit::Gated(0));
+		assert_eq!(call_unreadable(&["hook", "clear", "--flag", NAME, "--dir", dir]), Exit::Success);
 		assert!(!repo.path().join(".git").join(NAME).exists());
-		assert_eq!(call_unreadable(&gate), (Exit::Success, String::new()), "skipped after clear");
+		assert_eq!(call_unreadable(&gate), Exit::Success, "skipped after clear");
 		return Ok(());
 	}
 
@@ -726,7 +749,7 @@ mod tests {
 		let edit: String = format!(r#"{{"workspace":{{"root":"{root}"}},"change":{{"file":"lib.rs"}}}}"#);
 		let mark: [&str; 10] =
 			["hook", "mark", "--flag", NAME, "--suffix", ".rs", "--dir-from", "/workspace/root", "--path-from", "/change/file"];
-		assert_eq!(call_with(&mark, &edit)?, (Exit::Success, String::new(), String::new()));
+		assert_eq!(shown(&call_with(&mark, &edit)?), (Exit::Success, "", ""));
 		assert!(repo.path().join(".git").join(NAME).is_file());
 		let gate: [&str; 12] =
 			["gate", "--flag", NAME, "--dir-from", "/workspace/root", "--skip-if", "/rerun", "--", "git", "rev-parse", "--verify", "no-such-ref"];
@@ -754,12 +777,13 @@ mod tests {
 	// A field of the wrong type is an error, never a silent default.
 	#[test]
 	fn a_payload_field_of_the_wrong_type_fails_noisily() -> Result<(), String> {
-		let cases: [(Vec<&str>, &str, &str); 3] = [
-			(MARK.to_vec(), r#"{"cwd":5}"#, "gitblitz: payload field /cwd is not a string"),
-			(MARK.to_vec(), r#"{"tool_input":{"file_path":["a.rs"]}}"#, "gitblitz: payload field /tool_input/file_path is not a string"),
-			(gate_args(&["git", "--version"]), r#"{"stop_hook_active":"yes"}"#, "gitblitz: payload field /stop_hook_active is not a bool"),
+		let version_gate: Vec<&str> = gate_args(&["git", "--version"]);
+		let cases: [(&[&str], &str, &str); 3] = [
+			(&MARK, r#"{"cwd":5}"#, "gitblitz: payload field /cwd is not a string"),
+			(&MARK, r#"{"tool_input":{"file_path":["a.rs"]}}"#, "gitblitz: payload field /tool_input/file_path is not a string"),
+			(&version_gate, r#"{"stop_hook_active":"yes"}"#, "gitblitz: payload field /stop_hook_active is not a bool"),
 		];
-		return cases.iter().try_for_each(|(args, stdin, want): &(Vec<&str>, &str, &str)| -> Result<(), String> {
+		return cases.iter().try_for_each(|(args, stdin, want): &(&[&str], &str, &str)| -> Result<(), String> {
 			let (code, _, err) = call_with(args, stdin)?;
 			assert_eq!((code, err.trim_end()), (Exit::Failure, *want), "{stdin}");
 			return Ok(());

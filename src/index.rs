@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use crate::error::{Miss, MissReason};
+use crate::file_list::{FileList, Span};
 use crate::object_format::ObjectFormat;
 
 const SIGNATURE: &[u8; 4] = b"DIRC";
@@ -34,25 +35,33 @@ const UNSUPPORTED_EXTENSIONS: [&[u8; 4]; 2] = [b"link", b"sdir"];
 ///
 /// # Errors
 /// A [`Miss`] (naming `path`) for any layout this reader does not settle.
-pub fn tracked_paths(bytes: &[u8], path: &Path) -> Result<Vec<String>, Miss> {
+pub fn tracked_paths(bytes: &[u8], path: &Path) -> Result<FileList, Miss> {
 	return read_paths(bytes).map_err(|reason: MissReason| return Miss::new(path, reason));
 }
 
-fn read_paths(bytes: &[u8]) -> Result<Vec<String>, MissReason> {
+// Every name goes into one buffer; a v4 name copies its kept prefix from the previous name's span.
+fn read_paths(bytes: &[u8]) -> Result<FileList, MissReason> {
 	let (version, count) = header(bytes)?;
 	// A corrupt count must not reserve more than the file could hold.
-	let mut paths: Vec<String> = Vec::with_capacity(count.min(bytes.len() / ENTRY_FIXED_LEN));
-	let mut name: Vec<u8> = Vec::new();
+	let mut spans: Vec<Span> = Vec::with_capacity(count.min(bytes.len() / ENTRY_FIXED_LEN));
+	let mut names: Vec<u8> = Vec::new();
 	let mut pos: usize = HEADER_LEN;
+	let mut previous: usize = 0;
 	for _ in 0..count {
-		pos = entry(bytes, pos, version, &mut name)?;
-		paths.push(str::from_utf8(&name).map_err(|_| MissReason::Malformed)?.to_owned());
+		let start: usize = names.len();
+		pos = entry(bytes, pos, version, &mut names, previous)?;
+		str::from_utf8(names.get(start..).unwrap_or_default()).map_err(|_| MissReason::Malformed)?;
+		spans.push(Span::new(start, names.len()));
+		previous = start;
 	}
-	return match extensions_are_supported(bytes, pos) {
-		Some(true) => Ok(paths),
-		Some(false) => Err(MissReason::UnsupportedIndex),
-		None => Err(MissReason::Malformed),
-	};
+	match extensions_are_supported(bytes, pos) {
+		Some(true) => {}
+		Some(false) => return Err(MissReason::UnsupportedIndex),
+		None => return Err(MissReason::Malformed),
+	}
+	// Cannot fail: the spans tile the buffer and the loop checks each one as UTF-8.
+	let text: String = String::from_utf8(names).map_err(|_| MissReason::Malformed)?;
+	return Ok(FileList::from_parts(text, spans));
 }
 
 fn header(bytes: &[u8]) -> Result<(u32, usize), MissReason> {
@@ -67,8 +76,9 @@ fn header(bytes: &[u8]) -> Result<(u32, usize), MissReason> {
 	return Ok((version, usize::try_from(count).map_err(|_| MissReason::Malformed)?));
 }
 
-// The entry at `start`: its path goes into `name`, and the return value is where the next entry starts.
-fn entry(bytes: &[u8], start: usize, version: u32, name: &mut Vec<u8>) -> Result<usize, MissReason> {
+// The entry at `start`: its path goes on the end of `names`, whose previous path starts at `previous`.
+// The return value is where the next entry starts.
+fn entry(bytes: &[u8], start: usize, version: u32, names: &mut Vec<u8>, previous: usize) -> Result<usize, MissReason> {
 	let mode: u32 = be_u32(bytes, start + MODE_OFFSET).ok_or(MissReason::Malformed)?;
 	let flags: u16 = be_u16(bytes, start + ENTRY_FIXED_LEN - 2).ok_or(MissReason::Malformed)?;
 	if flags & FLAG_STAGE_MASK != 0 || mode == SPARSE_DIR_MODE {
@@ -77,30 +87,30 @@ fn entry(bytes: &[u8], start: usize, version: u32, name: &mut Vec<u8>) -> Result
 	let extended: usize = if flags & FLAG_EXTENDED == 0 { 0 } else { EXTENDED_FLAGS_LEN };
 	let pos: usize = start + ENTRY_FIXED_LEN + extended;
 	if version == PATH_COMPRESSED_VERSION {
-		return compressed_name(bytes, pos, name);
+		return compressed_name(bytes, pos, names, previous);
 	}
-	return padded_name(bytes, start, pos, flags, name);
+	return padded_name(bytes, start, pos, flags, names);
 }
 
-fn compressed_name(bytes: &[u8], pos: usize, name: &mut Vec<u8>) -> Result<usize, MissReason> {
+// v4: the previous path less `strip` bytes from its end, then the suffix; the cut may fall inside a character.
+fn compressed_name(bytes: &[u8], pos: usize, names: &mut Vec<u8>, previous: usize) -> Result<usize, MissReason> {
 	let (strip, used) = varint(bytes, pos).ok_or(MissReason::Malformed)?;
 	let suffix: &[u8] = until_nul(bytes, pos + used).ok_or(MissReason::Malformed)?;
-	let kept: usize = name.len().checked_sub(strip).ok_or(MissReason::Malformed)?;
-	name.truncate(kept);
-	name.extend_from_slice(suffix);
+	let kept: usize = (names.len() - previous).checked_sub(strip).ok_or(MissReason::Malformed)?;
+	names.extend_from_within(previous..previous + kept);
+	names.extend_from_slice(suffix);
 	return Ok(pos + used + suffix.len() + 1);
 }
 
 // v2/v3: the flags hold the name length (or 0xFFF for a longer, NUL-terminated name); NUL bytes pad the entry.
-fn padded_name(bytes: &[u8], start: usize, pos: usize, flags: u16, name: &mut Vec<u8>) -> Result<usize, MissReason> {
+fn padded_name(bytes: &[u8], start: usize, pos: usize, flags: u16, names: &mut Vec<u8>) -> Result<usize, MissReason> {
 	let name_len: usize = usize::from(flags & NAME_LEN_MASK);
 	let found: &[u8] = if name_len < usize::from(NAME_LEN_MASK) {
 		bytes.get(pos..pos + name_len).ok_or(MissReason::Malformed)?
 	} else {
 		until_nul(bytes, pos).ok_or(MissReason::Malformed)?
 	};
-	name.clear();
-	name.extend_from_slice(found);
+	names.extend_from_slice(found);
 	let name_offset: usize = pos - start;
 	return Ok(start + (name_offset + found.len() + ENTRY_ALIGN) / ENTRY_ALIGN * ENTRY_ALIGN);
 }
@@ -155,22 +165,22 @@ mod tests {
 
 	use super::{tracked_paths, varint};
 	use crate::error::MissReason;
+	use crate::file_list::FileList;
 
 	const REGULAR: u32 = 0o100_644;
 	const SPARSE_DIR: u32 = 0o040_000;
 
 	// An entry's fixed part: zero stat data and oid around `mode`, then `flags`.
-	fn fixed(mode: u32, flags: u16) -> Vec<u8> {
-		let mut out: Vec<u8> = vec![0; 24];
-		out.extend_from_slice(&mode.to_be_bytes());
-		out.resize(60, 0);
-		out.extend_from_slice(&flags.to_be_bytes());
+	fn fixed(mode: u32, flags: u16) -> [u8; 62] {
+		let mut out: [u8; 62] = [0; 62];
+		out[24..28].copy_from_slice(&mode.to_be_bytes());
+		out[60..].copy_from_slice(&flags.to_be_bytes());
 		return out;
 	}
 
 	// v2/v3: the fixed part, two extended-flag bytes when `flags` asks, then `name` NUL-padded to 8 bytes.
 	fn entry(mode: u32, flags: u16, name: &[u8]) -> Vec<u8> {
-		let mut out: Vec<u8> = fixed(mode, flags);
+		let mut out: Vec<u8> = fixed(mode, flags).to_vec();
 		if flags & 0x4000 != 0 {
 			out.extend_from_slice(&[0, 0]);
 		}
@@ -184,10 +194,10 @@ mod tests {
 	}
 
 	// v4: the fixed part, the bytes to strip from the previous name (a one-byte varint), the suffix and a NUL.
-	fn compressed(strip: u8, suffix: &str) -> Vec<u8> {
-		let mut out: Vec<u8> = fixed(REGULAR, 0);
+	fn compressed(strip: u8, suffix: &[u8]) -> Vec<u8> {
+		let mut out: Vec<u8> = fixed(REGULAR, 0).to_vec();
 		out.push(strip);
-		out.extend_from_slice(suffix.as_bytes());
+		out.extend_from_slice(suffix);
 		out.push(0);
 		return out;
 	}
@@ -210,8 +220,10 @@ mod tests {
 		return out;
 	}
 
+	// The reader keeps index order; `read_files` sorts.
 	fn paths(bytes: &[u8]) -> Result<Vec<String>, MissReason> {
-		return tracked_paths(bytes, Path::new("index")).map_err(|m| m.reason);
+		let files: FileList = tracked_paths(bytes, Path::new("index")).map_err(|m| m.reason)?;
+		return Ok(files.texts().map(String::from).collect());
 	}
 
 	fn owned(names: &[&str]) -> Result<Vec<String>, MissReason> {
@@ -264,16 +276,28 @@ mod tests {
 		assert_eq!(paths(&index(3, &entries, &[])), owned(&["x.rs", "y.rs"]));
 	}
 
+	// Each name must be UTF-8 on its own: the reader refuses two halves of `é`, which together are UTF-8.
 	#[test]
 	fn a_non_utf8_name_is_malformed() {
 		assert_eq!(paths(&index(2, &[entry(REGULAR, 4, b"caf\xe9")], &[])), Err(MissReason::Malformed));
+		let halves: [Vec<u8>; 2] = [entry(REGULAR, 1, b"\xc3"), entry(REGULAR, 1, b"\xa9")];
+		assert_eq!(paths(&index(2, &halves, &[])), Err(MissReason::Malformed));
 	}
 
 	#[test]
 	fn a_v4_entry_reuses_the_previous_name_and_refuses_an_overlong_strip() {
-		let shared: [Vec<u8>; 2] = [compressed(0, "dir/a.rs"), compressed(4, "b.rs")];
-		assert_eq!(paths(&index(4, &shared, &[])), owned(&["dir/a.rs", "dir/b.rs"]));
-		assert_eq!(paths(&index(4, &[compressed(1, "a.rs")], &[])), Err(MissReason::Malformed), "nothing to strip");
+		let shared: [Vec<u8>; 3] = [compressed(0, b"dir/a.rs"), compressed(4, b"b.rs"), compressed(4, b"c/d.rs")];
+		assert_eq!(paths(&index(4, &shared, &[])), owned(&["dir/a.rs", "dir/b.rs", "dir/c/d.rs"]));
+		assert_eq!(paths(&index(4, &[compressed(1, b"a.rs")], &[])), Err(MissReason::Malformed), "nothing to strip");
+		let overlong: [Vec<u8>; 2] = [compressed(0, b"ab"), compressed(3, b"c")];
+		assert_eq!(paths(&index(4, &overlong, &[])), Err(MissReason::Malformed), "more to strip than the previous name");
+	}
+
+	// git strips bytes, so `é` (C3 A9) then `ê` (C3 AA) keeps one byte of the first and adds the rest.
+	#[test]
+	fn a_v4_strip_may_cut_inside_a_character() {
+		let accents: [Vec<u8>; 2] = [compressed(0, "é".as_bytes()), compressed(1, b"\xaa")];
+		assert_eq!(paths(&index(4, &accents, &[])), owned(&["é", "ê"]));
 	}
 
 	#[test]

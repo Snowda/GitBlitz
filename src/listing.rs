@@ -6,60 +6,61 @@
 //! `ignore` crate. Paths come back relative to `dir`, as git prints them when run in `dir`.
 use foldhash::HashSet;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use ignore::{DirEntry, Match, WalkBuilder};
+use ignore::{DirEntry, Match, Walk, WalkBuilder};
 
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use crate::config::{self, RepoConfig, CONFIG_FILE};
 use crate::discover::{locate, require_head, Location, DOT_GIT};
 use crate::error::{Miss, MissReason};
+use crate::file_list::FileList;
 use crate::index;
 use crate::object_format::ObjectFormat;
-use crate::refs::{common_dir, CONFIG_FILE};
+use crate::refs::common_dir;
 
 const INDEX_FILE: &str = "index";
 const INDEX_LOCK_FILE: &str = "index.lock";
 const INFO_EXCLUDE: &str = "info/exclude";
 const GITIGNORE_FILE: &str = ".gitignore";
-const OBJECT_FORMAT_KEY: &str = "objectformat";
-const IGNORE_CASE_KEY: &str = "ignorecase";
-const TRUE: &str = "true";
 
 /// The files `git ls-files -z --cached --others --exclude-standard` run in `dir` lists, sorted.
 ///
 /// # Errors
 /// A [`Miss`] for anything this reader does not settle: see [`MissReason`].
-pub fn read_files(dir: &Path) -> Result<Vec<PathBuf>, Miss> {
+pub fn read_files(dir: &Path) -> Result<FileList, Miss> {
 	let Location { start, top, git_dir } = locate(dir)?;
 	require_head(&git_dir)?;
 	let top: &Path = &top;
 	let common: PathBuf = common_dir(&git_dir)?;
-	let config: String = read_config(&common)?;
-	if config_says(&config, OBJECT_FORMAT_KEY, ObjectFormat::Sha256.name()) {
+	// Without a config file, git uses SHA-1 and does not fold case; so does this reader.
+	let config: RepoConfig = config::read(&common.join(CONFIG_FILE))?.unwrap_or_default();
+	if config.object_format != ObjectFormat::Sha1 {
 		return Err(Miss::new(&git_dir, MissReason::ObjectFormat));
 	}
-	let is_case_folded: bool = config_says(&config, IGNORE_CASE_KEY, TRUE);
-	let prefix: String = slashed(start.strip_prefix(top).map_err(|_| Miss::new(&start, MissReason::NotARepo))?);
-	let prefix: String = if prefix.is_empty() { prefix } else { format!("{prefix}/") };
+	let is_case_folded: bool = config.ignore_case;
+	let mut prefix: String = slashed(start.strip_prefix(top).map_err(|_| Miss::new(&start, MissReason::NotARepo))?);
+	if !prefix.is_empty() {
+		prefix.push('/');
+	}
 
-	let tracked: Vec<String> = tracked_under(&git_dir, &prefix)?;
-	let fold = |path: &str| if is_case_folded { path.to_lowercase() } else { path.to_owned() };
-	let known: HashSet<String> = tracked.iter().map(|p| fold(p)).collect();
-	let mut files: Vec<String> = tracked;
+	let mut files: FileList = tracked_under(&git_dir, &prefix)?;
+	let is_new = untracked_filter(&files, is_case_folded);
 	// git never descends into an ignored directory, so under one only the tracked files are listed.
 	let exclude: PathBuf = common.join(INFO_EXCLUDE);
 	if !is_under_ignored_dir(top, &start, &exclude, is_case_folded) {
-		for path in walk(&start, top, is_case_folded)? {
-			if !known.contains(&fold(&path)) {
-				files.push(path);
-			}
-		}
+		walk(&start, top, is_case_folded, &mut files, is_new)?;
 	}
-	let mut files: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
 	files.sort();
 	files.dedup();
 	return Ok(files);
+}
+
+// The dedup drops a walked path equal to a tracked one; with `core.ignoreCase`, this drops one that differs only in case.
+fn untracked_filter(tracked: &FileList, is_case_folded: bool) -> impl Fn(&str) -> bool + use<> {
+	let folded: Option<HashSet<String>> = is_case_folded.then(|| return tracked.texts().map(str::to_lowercase).collect());
+	return move |path: &str| return folded.as_ref().is_none_or(|known| return !known.contains(&path.to_lowercase()));
 }
 
 // Whether git's exclude rules ignore `start` or a directory between `top` and it. The walk applies
@@ -107,36 +108,25 @@ fn matcher(root: &Path, file: &Path, is_case_folded: bool) -> Gitignore {
 }
 
 // The index's paths under `prefix`, made relative to it. No index yet (a fresh repo) tracks nothing.
-fn tracked_under(git_dir: &Path, prefix: &str) -> Result<Vec<String>, Miss> {
+fn tracked_under(git_dir: &Path, prefix: &str) -> Result<FileList, Miss> {
 	if git_dir.join(INDEX_LOCK_FILE).exists() {
 		return Err(Miss::new(&git_dir.join(INDEX_LOCK_FILE), MissReason::IndexLocked));
 	}
 	let path: PathBuf = git_dir.join(INDEX_FILE);
 	let bytes: Vec<u8> = match fs::read(&path) {
 		Ok(bytes) => bytes,
-		Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(err) if err.kind() == ErrorKind::NotFound => return Ok(FileList::default()),
 		Err(err) => return Err(Miss::io(&path, &err)),
 	};
-	let paths: Vec<String> = index::tracked_paths(&bytes, &path)?;
-	return Ok(paths.into_iter().filter_map(|p| p.strip_prefix(prefix).map(str::to_owned)).collect());
+	let mut paths: FileList = index::tracked_paths(&bytes, &path)?;
+	paths.retain_under(prefix);
+	return Ok(paths);
 }
 
-// Every file under `start` that git's exclude rules let through, relative to `start`. A nested repo
-// (or a submodule) is listed by `ls-files` as one entry, which a file walk cannot reproduce: a Miss.
-fn walk(start: &Path, top: &Path, is_case_folded: bool) -> Result<Vec<String>, Miss> {
-	let walker = WalkBuilder::new(start)
-		.hidden(false)
-		.ignore(false)
-		.parents(true)
-		.git_ignore(true)
-		.git_exclude(true)
-		.git_global(true)
-		.require_git(true)
-		.ignore_case_insensitive(is_case_folded)
-		.filter_entry(|entry| entry.file_name() != DOT_GIT)
-		.build();
-	let mut out: Vec<String> = Vec::new();
-	for entry in walker {
+// Appends to `files` every file under `start` that git's exclude rules let through and `keep` accepts, relative
+// to `start`. A nested repo (or a submodule) is listed by `ls-files` as one entry, which a file walk cannot reproduce: a Miss.
+fn walk(start: &Path, top: &Path, is_case_folded: bool, files: &mut FileList, keep: impl Fn(&str) -> bool) -> Result<(), Miss> {
+	for entry in walker(start, is_case_folded) {
 		let entry: DirEntry = entry.map_err(|err| Miss::new(start, MissReason::Io(err.io_error().map_or(ErrorKind::Other, |e| e.kind()))))?;
 		let is_dir: bool = entry.file_type().is_some_and(|t| t.is_dir());
 		if is_dir {
@@ -147,26 +137,27 @@ fn walk(start: &Path, top: &Path, is_case_folded: bool) -> Result<Vec<String>, M
 			continue;
 		}
 		let relative: &Path = entry.path().strip_prefix(start).map_err(|_| Miss::new(entry.path(), MissReason::Malformed))?;
-		out.push(slashed(relative));
+		files.push_slashed(&relative.to_string_lossy());
+		if files.last().is_some_and(|path: &str| return !keep(path)) {
+			files.pop();
+		}
 	}
-	return Ok(out);
+	return Ok(());
 }
 
-fn read_config(common: &Path) -> Result<String, Miss> {
-	let path: PathBuf = common.join(CONFIG_FILE);
-	return match fs::read_to_string(&path) {
-		Ok(text) => Ok(text),
-		Err(err) if err.kind() == ErrorKind::NotFound => Ok(String::new()),
-		Err(err) => Err(Miss::io(&path, &err)),
-	};
-}
-
-// Whether a `key = value` line sets `key` to `value`; git config keys and booleans are case-insensitive.
-// This skips the section: `objectformat` (extensions) and `ignorecase` (core) each occur in one section only.
-fn config_says(config: &str, key: &str, value: &str) -> bool {
-	return config.lines().filter_map(|line| line.split_once('=')).any(|(k, v)| {
-		return k.trim().eq_ignore_ascii_case(key) && v.trim().eq_ignore_ascii_case(value);
-	});
+// A walk under `start` with git's exclude rules: `.gitignore` files, `info/exclude` and the global excludes file.
+fn walker(start: &Path, is_case_folded: bool) -> Walk {
+	return WalkBuilder::new(start)
+		.hidden(false)
+		.ignore(false)
+		.parents(true)
+		.git_ignore(true)
+		.git_exclude(true)
+		.git_global(true)
+		.require_git(true)
+		.ignore_case_insensitive(is_case_folded)
+		.filter_entry(|entry| entry.file_name() != DOT_GIT)
+		.build();
 }
 
 fn slashed(path: &Path) -> String {
@@ -179,10 +170,11 @@ mod tests {
 	use std::io::ErrorKind;
 	use std::path::{Path, PathBuf};
 
-	use super::read_files;
+	use super::{is_under_ignored_dir, read_files};
 	use crate::env::GitEnv;
 	use crate::error::MissReason;
-	use crate::testrepo::{commit, git, new_repo};
+	use crate::file_list::FileList;
+	use crate::testrepo::{commit, git, new_repo, ok};
 	use crate::{list_files, LS_FILES_ARGS};
 
 	// The oracle: what git itself lists from `dir`.
@@ -193,12 +185,14 @@ mod tests {
 		return Ok(files);
 	}
 
+	fn has(files: &FileList, path: &str) -> bool {
+		return files.iter().any(|listed: &Path| return listed == Path::new(path));
+	}
+
 	fn put(root: &Path, rel: &str, text: &str) -> Result<(), String> {
 		let path: PathBuf = root.join(rel);
-		if let Some(parent) = path.parent() {
-			fs::create_dir_all(parent).map_err(|e| format!("mkdir {rel}: {e}"))?;
-		}
-		return fs::write(&path, text).map_err(|e| format!("write {rel}: {e}"));
+		ok(fs::create_dir_all(path.parent().unwrap_or(root)), &format!("mkdir {rel}"))?;
+		return ok(fs::write(&path, text), &format!("write {rel}"));
 	}
 
 	fn miss_reason(dir: &Path) -> Option<MissReason> {
@@ -217,7 +211,7 @@ mod tests {
 		git(root, &["add", ".gitignore", "src/main.rs", "sub/deep/b.rs", "gone.rs"])?;
 		git(root, &["add", "-f", "forced.log"])?;
 		commit(root, "fixture")?;
-		fs::remove_file(root.join("gone.rs")).map_err(|e| format!("rm: {e}"))?;
+		ok(fs::remove_file(root.join("gone.rs")), "rm")?;
 		put(root, "new.rs", "untracked\n")?;
 		put(root, "sub/new.txt", "untracked too\n")?;
 		put(root, "noise.log", "ignored\n")?;
@@ -229,15 +223,15 @@ mod tests {
 	fn a_work_tree_lists_exactly_what_ls_files_lists() -> Result<(), String> {
 		let repo = work_tree()?;
 		let root: &Path = repo.path();
-		let got: Vec<PathBuf> = read_files(root).map_err(|m| format!("read_files: {m}"))?;
+		let got: FileList = ok(read_files(root), "read_files")?;
 		assert_eq!(got, ls_files(root)?);
 		// The index is what keeps the tracked-but-ignored file and the deleted one: a walk sees neither.
-		assert!(got.contains(&PathBuf::from("forced.log")) && got.contains(&PathBuf::from("gone.rs")), "{got:?}");
-		assert!(!got.contains(&PathBuf::from("noise.log")) && !got.contains(&PathBuf::from("build/out.o")), "{got:?}");
+		assert!(has(&got, "forced.log") && has(&got, "gone.rs"), "{got:?}");
+		assert!(!has(&got, "noise.log") && !has(&got, "build/out.o"), "{got:?}");
 		// From a subdirectory, paths are relative to it and cover only its subtree.
 		let sub: PathBuf = root.join("sub");
-		assert_eq!(read_files(&sub).map_err(|m| format!("read_files(sub): {m}"))?, ls_files(&sub)?);
-		assert_eq!(list_files(root, GitEnv::NONE).map_err(|e| format!("list_files: {e}"))?, got, "the reader answers");
+		assert_eq!(ok(read_files(&sub), "read_files(sub)")?, ls_files(&sub)?);
+		assert_eq!(ok(list_files(root, GitEnv::NONE), "list_files")?, got, "the reader answers");
 		return Ok(());
 	}
 
@@ -250,12 +244,12 @@ mod tests {
 	// A SHA-256 index has wider entries than the reader parses, so it misses and `list_files` asks git.
 	#[test]
 	fn a_sha256_repo_misses_and_list_files_asks_git() -> Result<(), String> {
-		let repo = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+		let repo = ok(tempfile::tempdir(), "tempdir")?;
 		git(repo.path(), &["init", "-q", "-b", "main", "--object-format=sha256"])?;
 		put(repo.path(), "a.rs", "x\n")?;
 		git(repo.path(), &["add", "a.rs"])?;
 		assert_eq!(miss_reason(repo.path()), Some(MissReason::ObjectFormat));
-		assert_eq!(list_files(repo.path(), GitEnv::NONE).map_err(|e| format!("list_files: {e}"))?, ls_files(repo.path())?);
+		assert_eq!(ok(list_files(repo.path(), GitEnv::NONE), "list_files")?, ls_files(repo.path())?);
 		assert_eq!(ls_files(repo.path())?, vec![PathBuf::from("a.rs")]);
 		return Ok(());
 	}
@@ -264,8 +258,8 @@ mod tests {
 	#[test]
 	fn a_missing_config_reads_as_empty() -> Result<(), String> {
 		let repo = work_tree()?;
-		fs::remove_file(repo.path().join(".git/config")).map_err(|e| format!("rm config: {e}"))?;
-		assert_eq!(read_files(repo.path()).map_err(|m| format!("read_files: {m}"))?, ls_files(repo.path())?);
+		ok(fs::remove_file(repo.path().join(".git/config")), "rm config")?;
+		assert_eq!(ok(read_files(repo.path()), "read_files")?, ls_files(repo.path())?);
 		return Ok(());
 	}
 
@@ -275,12 +269,12 @@ mod tests {
 		let repo = new_repo()?;
 		put(repo.path(), "a.rs", "x\n")?;
 		let index: PathBuf = repo.path().join(".git/index");
-		fs::create_dir(&index).map_err(|e| format!("mkdir index: {e}"))?;
+		ok(fs::create_dir(&index), "mkdir index")?;
 		assert!(is_io_miss_at(repo.path(), &index), "{:?}", read_files(repo.path()));
-		fs::remove_dir(&index).map_err(|e| format!("rmdir index: {e}"))?;
+		ok(fs::remove_dir(&index), "rmdir index")?;
 		let config: PathBuf = repo.path().join(".git/config");
-		fs::remove_file(&config).map_err(|e| format!("rm config: {e}"))?;
-		fs::create_dir(&config).map_err(|e| format!("mkdir config: {e}"))?;
+		ok(fs::remove_file(&config), "rm config")?;
+		ok(fs::create_dir(&config), "mkdir config")?;
 		assert!(is_io_miss_at(repo.path(), &config), "{:?}", read_files(repo.path()));
 		return Ok(());
 	}
@@ -297,7 +291,7 @@ mod tests {
 		git(root, &["add", "-f", "comparison/kept.rs"])?;
 		commit(root, "fixture")?;
 		let sub: PathBuf = root.join("comparison");
-		let got: Vec<PathBuf> = read_files(&sub).map_err(|m| format!("read_files: {m}"))?;
+		let got: FileList = ok(read_files(&sub), "read_files")?;
 		assert_eq!(got, ls_files(&sub)?);
 		assert_eq!(got, vec![PathBuf::from("kept.rs")], "the walk adds nothing under an ignored directory");
 		return Ok(());
@@ -315,10 +309,10 @@ mod tests {
 		git(root, &["add", ".gitignore", "a/.gitignore"])?;
 		commit(root, "fixture")?;
 		let kept: PathBuf = root.join("a/deep/x");
-		assert_eq!(read_files(&kept).map_err(|m| format!("read_files(a): {m}"))?, ls_files(&kept)?);
+		assert_eq!(ok(read_files(&kept), "read_files(a)")?, ls_files(&kept)?);
 		assert_eq!(ls_files(&kept)?, vec![PathBuf::from("y.rs")], "git lists the whitelisted file");
 		let dropped: PathBuf = root.join("c/deep/x");
-		assert_eq!(read_files(&dropped).map_err(|m| format!("read_files(c): {m}"))?, ls_files(&dropped)?);
+		assert_eq!(ok(read_files(&dropped), "read_files(c)")?, ls_files(&dropped)?);
 		assert_eq!(ls_files(&dropped)?, Vec::<PathBuf>::new(), "git lists nothing under the ignored directory");
 		return Ok(());
 	}
@@ -327,9 +321,9 @@ mod tests {
 	fn a_path_compressed_v4_index_reads_the_same() -> Result<(), String> {
 		let repo = work_tree()?;
 		git(repo.path(), &["update-index", "--index-version", "4"])?;
-		let header: Vec<u8> = fs::read(repo.path().join(".git/index")).map_err(|e| format!("read index: {e}"))?;
+		let header: Vec<u8> = ok(fs::read(repo.path().join(".git/index")), "read index")?;
 		assert_eq!(header.get(4..8), Some([0u8, 0, 0, 4].as_slice()), "the fixture really is a v4 index");
-		assert_eq!(read_files(repo.path()).map_err(|m| format!("read_files: {m}"))?, ls_files(repo.path())?);
+		assert_eq!(ok(read_files(repo.path()), "read_files")?, ls_files(repo.path())?);
 		return Ok(());
 	}
 
@@ -338,12 +332,12 @@ mod tests {
 		let split = work_tree()?;
 		git(split.path(), &["update-index", "--split-index"])?;
 		assert_eq!(miss_reason(split.path()), Some(MissReason::UnsupportedIndex));
-		assert_eq!(list_files(split.path(), GitEnv::NONE).map_err(|e| format!("list_files: {e}"))?, ls_files(split.path())?);
+		assert_eq!(ok(list_files(split.path(), GitEnv::NONE), "list_files")?, ls_files(split.path())?);
 
 		let nested = work_tree()?;
 		git(&nested.path().join("sub"), &["init", "-q"])?;
 		assert_eq!(miss_reason(nested.path()), Some(MissReason::NestedRepo));
-		assert_eq!(list_files(nested.path(), GitEnv::NONE).map_err(|e| format!("list_files: {e}"))?, ls_files(nested.path())?);
+		assert_eq!(ok(list_files(nested.path(), GitEnv::NONE), "list_files")?, ls_files(nested.path())?);
 
 		let locked = work_tree()?;
 		put(locked.path(), ".git/index.lock", "")?;
@@ -363,13 +357,42 @@ mod tests {
 		put(root, "sub/x.rs", "in the nested repo\n")?;
 		git(&root.join("sub"), &["init", "-q"])?;
 		assert_eq!(miss_reason(root), Some(MissReason::NestedRepo));
-		let listed: Vec<PathBuf> = list_files(root, GitEnv::NONE).map_err(|e| format!("list_files: {e}"))?;
+		let listed: FileList = ok(list_files(root, GitEnv::NONE), "list_files")?;
 		assert_eq!(listed, ls_files(root)?);
-		assert!(!listed.contains(&PathBuf::from("sub/x.rs")), "git does not list inside a nested repo: {listed:?}");
+		assert!(!has(&listed, "sub/x.rs"), "git does not list inside a nested repo: {listed:?}");
 		// The nested repo's own rules apply inside it, so its `.gitignore` can hide its `.git` too.
 		put(root, "sub/.gitignore", ".*\n")?;
 		assert_eq!(miss_reason(root), Some(MissReason::NestedRepo));
-		assert_eq!(list_files(root, GitEnv::NONE).map_err(|e| format!("list_files: {e}"))?, ls_files(root)?);
+		assert_eq!(ok(list_files(root, GitEnv::NONE), "list_files")?, ls_files(root)?);
+		return Ok(());
+	}
+
+	// A repo with `Readme.md` committed, renamed on disk to `README.md`, and `core.ignoreCase` set to `value`.
+	fn renamed_case(value: &str) -> Result<tempfile::TempDir, String> {
+		let repo = new_repo()?;
+		let root: &Path = repo.path();
+		put(root, "Readme.md", "x\n")?;
+		git(root, &["add", "Readme.md"])?;
+		commit(root, "fixture")?;
+		ok(fs::rename(root.join("Readme.md"), root.join("README.md")), "rename")?;
+		let config: PathBuf = root.join(".git/config");
+		let text: String = ok(fs::read_to_string(&config), "read config")?;
+		let kept: String = text.lines().filter(|l| !l.to_ascii_lowercase().contains("ignorecase")).collect::<Vec<_>>().join("\n");
+		ok(fs::write(&config, format!("{kept}\n[core]\n\tignorecase = {value}\n")), "write config")?;
+		return Ok(repo);
+	}
+
+	// git folds case for `1` as for `true`: the renamed file matches its index entry and is not untracked.
+	#[test]
+	fn ignorecase_set_to_1_folds_case_like_git() -> Result<(), String> {
+		let folded = renamed_case("1")?;
+		let got: FileList = ok(read_files(folded.path()), "read_files(1)")?;
+		assert_eq!(got, ls_files(folded.path())?);
+		assert_eq!(got, vec![PathBuf::from("Readme.md")], "folded: only the index entry");
+		let exact = renamed_case("0")?;
+		let got: FileList = ok(read_files(exact.path()), "read_files(0)")?;
+		assert_eq!(got, ls_files(exact.path())?);
+		assert_eq!(got, vec![PathBuf::from("README.md"), PathBuf::from("Readme.md")], "not folded: the rename is untracked");
 		return Ok(());
 	}
 
@@ -377,8 +400,21 @@ mod tests {
 	fn a_repo_with_nothing_added_lists_its_untracked_files() -> Result<(), String> {
 		let repo = new_repo()?;
 		put(repo.path(), "a.rs", "x\n")?;
-		assert_eq!(read_files(repo.path()).map_err(|m| format!("read_files: {m}"))?, vec![PathBuf::from("a.rs")]);
+		assert_eq!(ok(read_files(repo.path()), "read_files")?, vec![PathBuf::from("a.rs")]);
 		assert_eq!(ls_files(repo.path())?, vec![PathBuf::from("a.rs")]);
+		return Ok(());
+	}
+
+	// No level lies between `top` and a start outside it, so even a `*` rule ignores nothing.
+	#[test]
+	fn a_start_outside_top_is_never_under_an_ignored_dir() -> Result<(), String> {
+		let top = ok(tempfile::tempdir(), "tempdir(top)")?;
+		let elsewhere = ok(tempfile::tempdir(), "tempdir(elsewhere)")?;
+		put(top.path(), ".gitignore", "*\n")?;
+		let exclude: PathBuf = top.path().join(".git/info/exclude");
+		assert!(!is_under_ignored_dir(top.path(), elsewhere.path(), &exclude, false));
+		assert!(!is_under_ignored_dir(top.path(), top.path(), &exclude, false), "top itself is never checked");
+		assert!(is_under_ignored_dir(top.path(), &top.path().join("x"), &exclude, false), "the same rule ignores a level below top");
 		return Ok(());
 	}
 }
