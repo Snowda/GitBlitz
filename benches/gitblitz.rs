@@ -6,10 +6,11 @@ use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use gitblitz::GitEnv;
+use gitblitz::{GitEnv, Oid};
 use tempfile::TempDir;
 
 use isolating_config::ISOLATING_CONFIG;
@@ -25,6 +26,12 @@ const WARMUP_ITERS: usize = 50;
 const DEFAULT_LOOP_SECS: u64 = 5;
 const US_PER_SEC: f64 = 1e6;
 const MS_PER_SEC: f64 = 1e3;
+const OBJECT_ITERS: usize = 200;
+const OBJECT_GIT_ITERS: usize = 20;
+const OBJECT_FILES: usize = 20;
+const OBJECT_COMMITS: usize = 30;
+// A blob cap like parley's: every fixture blob fits under it.
+const OBJECT_CAP: u64 = 1 << 20;
 const P50: usize = 50;
 const P99: usize = 99;
 const PERCENT: usize = 100;
@@ -85,7 +92,7 @@ fn time_each(iters: usize, mut op: impl FnMut() -> io::Result<()>) -> io::Result
 	return Ok(times);
 }
 
-fn pct(sorted: &[Duration], percentile: usize) -> Duration {
+const fn pct(sorted: &[Duration], percentile: usize) -> Duration {
 	return sorted[(sorted.len() - 1) * percentile / PERCENT];
 }
 
@@ -138,7 +145,91 @@ fn table(out: &mut impl Write) -> io::Result<()> {
 	writeln!(out, "unborn head() = miss + git fallback: p50 {:.2}ms", pct(&fallback, P50).as_secs_f64() * MS_PER_SEC)?;
 	#[cfg(feature = "list")]
 	list_rows(out)?;
+	object_rows(out, tmp.path())?;
 	return Ok(());
+}
+
+// git with `input` on stdin, from a writer thread so a full stdout pipe cannot stall it.
+fn git_stdin(dir: &Path, args: &[&str], input: &[u8]) -> io::Result<Output> {
+	let mut child = Command::new("git")
+		.args(ISOLATING_CONFIG)
+		.args(args)
+		.current_dir(dir)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()?;
+	let mut stdin = child.stdin.take().ok_or_else(|| return io::Error::other("stdin not piped"))?;
+	return thread::scope(|scope| {
+		scope.spawn(move || return io::copy(&mut &input[..], &mut stdin));
+		return child.wait_with_output();
+	});
+}
+
+// A repo of OBJECT_FILES files edited over OBJECT_COMMITS commits, then packed with deltas when `is_packed`.
+fn object_fixture(dir: &Path, gc_args: Option<&[&str]>) -> io::Result<Vec<String>> {
+	fs::create_dir(dir)?;
+	git(dir, &["init", "-q", "-b", "main"])?;
+	let paths: Vec<String> = (0..OBJECT_FILES).map(|i| return format!("src/m{}/f{i}.rs", i % 4)).collect();
+	(0..OBJECT_COMMITS).try_for_each(|round: usize| -> io::Result<()> {
+		paths.iter().enumerate().try_for_each(|(i, rel): (usize, &String)| -> io::Result<()> {
+			let path: PathBuf = dir.join(rel);
+			fs::create_dir_all(path.parent().unwrap_or(dir))?;
+			let body: String = (0..=round).map(|r| return format!("fn f{i}_{r}() -> u32 {{ return {r}; }}\n")).collect();
+			return fs::write(path, body);
+		})?;
+		git(dir, &["add", "-A"])?;
+		return commit(dir).map(drop);
+	})?;
+	if let Some(args) = gc_args {
+		git(dir, args)?;
+	}
+	return Ok(paths);
+}
+
+// `read_objects` against `git cat-file --batch`, and `read_tree_entries` against `git ls-tree -l`.
+fn object_rows(out: &mut impl Write, tmp: &Path) -> io::Result<()> {
+	let shapes: [(&str, Option<&[&str]>); 2] = [("loose", None), ("gc --aggressive", Some(&["gc", "-q", "--aggressive"]))];
+	writeln!(out, "{:<16} {:>22} {:>22} {:>22} {:>22}", "objects", "read_objects p50", "cat-file --batch p50", "read_tree_entries p50", "ls-tree -l p50")?;
+	return shapes.iter().enumerate().try_for_each(|(n, (name, gc_args))| -> io::Result<()> {
+		let dir: PathBuf = tmp.join(format!("objects{n}"));
+		let paths: Vec<String> = object_fixture(&dir, *gc_args)?;
+		let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let head: String = String::from_utf8_lossy(&git(&dir, &["rev-parse", "HEAD"])?.stdout).trim().to_owned();
+		let commit: Oid = Oid::parse(&head).map_err(io::Error::other)?;
+		let entries = gitblitz::read_tree_entries(&dir, &commit, &path_refs).map_err(io::Error::other)?;
+		let oids: Vec<Oid> = entries.iter().map(|e| return e.oid).collect();
+		let input: Vec<u8> = oids.iter().flat_map(|oid| return format!("{oid}\n").into_bytes()).collect();
+		let read: Vec<Duration> = time_each(OBJECT_ITERS, || {
+			black_box(gitblitz::read_objects(black_box(&dir), &oids, OBJECT_CAP).map_err(io::Error::other)?);
+			return Ok(());
+		})?;
+		let batch: Vec<Duration> = time_each(OBJECT_GIT_ITERS, || {
+			black_box(git_stdin(&dir, &["cat-file", "--batch"], &input)?);
+			return Ok(());
+		})?;
+		let tree: Vec<Duration> = time_each(OBJECT_ITERS, || {
+			black_box(gitblitz::read_tree_entries(black_box(&dir), &commit, &path_refs).map_err(io::Error::other)?);
+			return Ok(());
+		})?;
+		let mut ls_args: Vec<&str> = vec!["ls-tree", "-l", &head, "--"];
+		ls_args.extend(&path_refs);
+		let ls: Vec<Duration> = time_each(OBJECT_GIT_ITERS, || {
+			black_box(git(&dir, &ls_args)?);
+			return Ok(());
+		})?;
+		let ms = |d: &[Duration]| -> f64 { return pct(d, P50).as_secs_f64() * MS_PER_SEC };
+		return writeln!(
+			out,
+			"{name:<16} {:>19.2}ms {:>19.2}ms {:>19.2}ms {:>19.2}ms   ({} blobs, {} paths)",
+			ms(&read),
+			ms(&batch),
+			ms(&tree),
+			ms(&ls),
+			oids.len(),
+			paths.len()
+		);
+	});
 }
 
 // `read_files` from the repo root and from `src`, which also checks the levels between them for an ignore rule.
@@ -180,6 +271,9 @@ fn main() -> io::Result<()> {
 		let secs: u64 = args.get(1).map_or(Ok(DEFAULT_LOOP_SECS), |s| return s.parse().map_err(io::Error::other))?;
 		let calls: u64 = spin(secs)?;
 		return writeln!(out, "loop: {calls} read_head+read_git_dir pairs in {secs}s");
+	}
+	if args.first().map(String::as_str) == Some("objects") {
+		return object_rows(&mut out, tempfile::tempdir()?.path());
 	}
 	return table(&mut out);
 }
