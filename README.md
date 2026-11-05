@@ -2,7 +2,7 @@
 
 > Answer git file system answers process-free.
 
-GitBlitz (crate `gitblitz`) answers three everyday git questions by reading the files under `.git`
+GitBlitz (crate `gitblitz`) answers five everyday git questions by reading the files under `.git`
 instead of spawning `git`:
 
 | git command                                            | GitBlitz (reads files, falls back to git) | file reader only (never spawns) |
@@ -10,6 +10,8 @@ instead of spawning `git`:
 | `git rev-parse --absolute-git-dir`                     | `gitblitz::git_dir`                       | `gitblitz::read_git_dir`        |
 | `git rev-parse HEAD`                                   | `gitblitz::head`                          | `gitblitz::read_head`           |
 | `git ls-files -z --cached --others --exclude-standard` | `gitblitz::list_files` (feature `list`)   | `gitblitz::read_files`          |
+| `git cat-file --batch` (bodies over a size cap unread) | `gitblitz::objects`                       | `gitblitz::read_objects`, `read_object`, `read_object_header` |
+| `git ls-tree --full-tree -l <tree-ish> -- <paths>`     | `gitblitz::tree_entries`                  | `gitblitz::read_tree_entries`, `read_tree_entry` |
 
 The rule is simple: **GitBlitz gives git's answer or asks git**. When the files cannot settle a question for
 certain (an unborn branch, a SHA-256 repo, a reftable, a redirecting `GIT_DIR`, …) the reader reports a
@@ -34,6 +36,13 @@ Measured on Windows 11 with `cargo bench --bench gitblitz --features list` (p50 
 A fallback costs what `git` costs (an unborn `head()` measured 18.7 ms), so the worst case is no slower
 than calling `git` yourself. `read_files` lists this repo in about 1.7 ms.
 
+Objects, 20 blobs and 20 paths in a repo of 30 commits (`cargo bench --bench gitblitz -- objects`, one run, p50):
+
+| store             | `read_objects` | `git cat-file --batch` | `read_tree_entries` | `git ls-tree -l` |
+| ----------------- | -------------- | ---------------------- | ------------------- | ---------------- |
+| loose objects     | 1.9 ms         | 25.5 ms                | 1.2 ms              | 23.5 ms          |
+| `gc --aggressive` | 1.2 ms         | 23.4 ms                | 0.6 ms              | 26.7 ms          |
+
 ## Adopting it
 
 ### As a library
@@ -49,8 +58,18 @@ gitblitz = { path = "../GitBlitz" }
 # add `features = ["list"]` for list_files / read_files
 ```
 
-The default build pulls in only `thiserror` and `arrayvec`. The `list` feature adds the `ignore` crate
-(the gitignore-aware walker from ripgrep).
+The default build pulls in only `thiserror`, `arrayvec`, `foldhash` and `miniz_oxide` (pure-Rust zlib, no
+`unsafe`). The `list` feature adds the `ignore` crate (the gitignore-aware walker from ripgrep).
+
+Objects take a full id (`gitblitz::Oid::parse`) and a size cap; an object over the cap comes back with its
+size and no body, and its body is never inflated:
+
+```rust
+let commit = gitblitz::Oid::parse(&head)?;
+for entry in gitblitz::tree_entries(repo, GitEnv::NONE, &commit, &["src/lib.rs"])? {
+	let found = gitblitz::objects(repo, GitEnv::NONE, &[entry.oid], 1 << 20)?; // None = git says missing
+}
+```
 
 Drop-in replacement for shelling out:
 
@@ -204,6 +223,10 @@ Answered from the files:
 - detached HEAD
 - (`list`) index versions 2–4, `.gitignore` at every level, `.git/info/exclude`, the global excludes file,
   `core.ignoreCase`, tracked files that a `.gitignore` also matches
+- (objects) loose objects; any number of packs (index v2 with 64-bit offsets, pack v2/v3); OFS_DELTA and
+  REF_DELTA chains up to git's 4095 depth, across packs and loose bases; commits, trees and tags as tree-ish;
+  every tree mode (`canon_mode`, so a stray 100664 prints as 100644), submodules and symlinks; an object's size
+  from its header alone, a delta's from the delta header
 
 Handed to `git` (a `Miss`, then the fallback):
 
@@ -213,6 +236,11 @@ Handed to `git` (a `Miss`, then the fallback):
 - a bare repo, or a directory that could be one
 - a redirecting `GIT_*` variable in your `GitEnv`
 - (`list`) a split or sparse index, unmerged entries, `index.lock` present, a nested repo or submodule
+- (objects) an object not in this store (missing, or behind `objects/info/alternates` or a promisor remote),
+  any `refs/replace/` ref, a caller's `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+  `GIT_REPLACE_REF_BASE` or `GIT_NO_REPLACE_OBJECTS`, a pack index v1, a path `ls-tree` would treat as a
+  pattern or normalise (`./a`, `a/`, `a//b`, `:(magic)`, empty), paths where one contains another, no paths
+  at all, and a blob given as the tree-ish
 - anything malformed or unreadable
 
 The tests build these repo shapes with `git` and compare GitBlitz's answer to `git`'s own output.
