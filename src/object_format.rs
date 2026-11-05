@@ -21,13 +21,13 @@ impl ObjectFormat {
 		return self.raw_len() * 2;
 	}
 
-	/// The `extensions.objectFormat` value that selects this format.
-	#[cfg(feature = "list")]
+	/// The format an `extensions.objectFormat` value selects; `None` for any other text, which git must judge.
 	#[must_use]
-	pub const fn name(self) -> &'static str {
-		return match self {
-			Self::Sha1 => "sha1",
-			Self::Sha256 => "sha256",
+	pub fn from_name(name: &str) -> Option<Self> {
+		return match name {
+			"sha1" => Some(Self::Sha1),
+			"sha256" => Some(Self::Sha256),
+			_ => None,
 		};
 	}
 }
@@ -42,9 +42,9 @@ mod tests {
 		assert_eq!([ObjectFormat::Sha1, ObjectFormat::Sha256].map(ObjectFormat::raw_len), [20, 32]);
 	}
 
-	#[cfg(feature = "list")]
 	#[test]
-	fn each_format_is_named_as_extensions_object_format_spells_it() {
-		assert_eq!([ObjectFormat::Sha1, ObjectFormat::Sha256].map(ObjectFormat::name), ["sha1", "sha256"]);
+	fn each_format_is_found_by_its_extensions_object_format_name() {
+		assert_eq!(["sha1", "sha256"].map(ObjectFormat::from_name), [Some(ObjectFormat::Sha1), Some(ObjectFormat::Sha256)]);
+		assert_eq!(["SHA256", "sha-1", ""].map(ObjectFormat::from_name), [None, None, None]);
 	}
 }

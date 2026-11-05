@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use arrayvec::ArrayString;
 
+use crate::config::{self, RepoConfig, CONFIG_FILE};
 use crate::discover::{locate, no_head, HEAD_FILE};
 use crate::error::{Miss, MissReason};
 use crate::object_format::ObjectFormat;
@@ -13,16 +14,15 @@ const SYMREF_PREFIX: &str = "ref: ";
 const BRANCH_PREFIX: &str = "refs/heads/";
 const COMMONDIR_FILE: &str = "commondir";
 const PACKED_REFS_FILE: &str = "packed-refs";
-pub const CONFIG_FILE: &str = "config";
-const REF_STORAGE_KEY: &str = "refstorage";
 const LOCK_SUFFIX: &str = ".lock";
 /// Hex digits in a SHA-256 object id, the longest oid git prints.
 pub const OID_HEX_MAX: usize = ObjectFormat::Sha256.hex_len();
 
-/// A commit id in hex, held inline: 40 digits from the file reader, up to 64 from git for SHA-256 repos.
+/// A commit id in hex, held inline: 40 digits, or 64 in a SHA-256 repo.
 pub type OidHex = ArrayString<OID_HEX_MAX>;
 
-/// HEAD's 40-hex commit id from `HEAD`, the loose branch ref or `packed-refs`, without spawning `git`.
+/// HEAD's commit id from `HEAD`, the loose branch ref or `packed-refs`, without spawning `git`: 40 hex, or 64
+/// when the config selects SHA-256.
 ///
 /// # Errors
 /// A [`Miss`] whenever the files cannot answer for sure; [`crate::head`] then asks git.
@@ -34,14 +34,14 @@ pub fn read_head(dir: &Path) -> Result<OidHex, Miss> {
 	let head: &str =
 		read_small(&head_path, &mut head_buf).map(str::trim_end).map_err(|err: IoError| return no_head(&head_path, &err))?;
 	let common: PathBuf = common_dir(&git_dir)?;
-	reject_reftable(&common)?;
+	let format: ObjectFormat = files_backend(&common)?.object_format;
 	let Some(refname) = head.strip_prefix(SYMREF_PREFIX) else {
-		return oid(&head_path, head);
+		return oid(&head_path, head, format);
 	};
 	if !is_plain_branch(refname) {
 		return Err(Miss::new(&head_path, MissReason::UnsupportedRef));
 	}
-	return branch_oid(&common, refname);
+	return branch_oid(&common, refname, format);
 }
 
 // A linked worktree's `commondir` names the shared repo, relative to its own git dir.
@@ -56,33 +56,29 @@ pub fn common_dir(git_dir: &Path) -> Result<PathBuf, Miss> {
 	};
 }
 
-// git reads refs from a reftable only when `extensions.refStorage` says so; a stray `reftable/` changes nothing.
-fn reject_reftable(common: &Path) -> Result<(), Miss> {
-	let config: PathBuf = common.join(CONFIG_FILE);
-	let text: Vec<u8> = fs::read(&config).map_err(|err| Miss::io(&config, &err))?;
-	if mentions(&text, REF_STORAGE_KEY) {
-		return Err(Miss::new(&config, MissReason::Reftable));
+// The repo's config, unless refs may live outside the files backend. git reads a reftable only when
+// `extensions.refStorage` says so, so a stray `reftable/` changes nothing.
+fn files_backend(common: &Path) -> Result<RepoConfig, Miss> {
+	let path: PathBuf = common.join(CONFIG_FILE);
+	let config: RepoConfig = config::read(&path)?.ok_or_else(|| return Miss::new(&path, MissReason::Io(ErrorKind::NotFound)))?;
+	if config.ref_storage {
+		return Err(Miss::new(&path, MissReason::Reftable));
 	}
-	return Ok(());
+	return Ok(config);
 }
 
-// Whether `text` holds `key` in any ASCII case; `key` is lowercase.
-fn mentions(text: &[u8], key: &str) -> bool {
-	return text.windows(key.len()).any(|window: &[u8]| return window.eq_ignore_ascii_case(key.as_bytes()));
-}
-
-fn branch_oid(common: &Path, refname: &str) -> Result<OidHex, Miss> {
+fn branch_oid(common: &Path, refname: &str, format: ObjectFormat) -> Result<OidHex, Miss> {
 	let loose: PathBuf = common.join(refname);
 	let mut buf: SmallBuf = [0; SMALL_FILE_MAX];
 	return match read_small(&loose, &mut buf) {
 		Ok(text) if text.starts_with(SYMREF_PREFIX) => Err(Miss::new(&loose, MissReason::SymbolicRef)),
-		Ok(text) => oid(&loose, text.trim_end()),
-		Err(err) if err.kind() == ErrorKind::NotFound => packed_oid(common, refname, &loose),
+		Ok(text) => oid(&loose, text.trim_end(), format),
+		Err(err) if err.kind() == ErrorKind::NotFound => packed_oid(common, refname, &loose, format),
 		Err(err) => Err(Miss::io(&loose, &err)),
 	};
 }
 
-fn packed_oid(common: &Path, refname: &str, loose: &Path) -> Result<OidHex, Miss> {
+fn packed_oid(common: &Path, refname: &str, loose: &Path, format: ObjectFormat) -> Result<OidHex, Miss> {
 	let path: PathBuf = common.join(PACKED_REFS_FILE);
 	let text: String = match fs::read_to_string(&path) {
 		Ok(text) => text,
@@ -90,7 +86,7 @@ fn packed_oid(common: &Path, refname: &str, loose: &Path) -> Result<OidHex, Miss
 		Err(err) => return Err(Miss::io(&path, &err)),
 	};
 	return match packed_entry(&text, refname) {
-		Some(hex) => oid(&path, hex),
+		Some(hex) => oid(&path, hex, format),
 		None => Err(Miss::new(loose, MissReason::Unborn)),
 	};
 }
@@ -103,9 +99,9 @@ fn packed_entry<'a>(text: &'a str, refname: &str) -> Option<&'a str> {
 		.find_map(|line| line.split_once(' ').filter(|&(_, name)| name == refname).map(|(hex, _)| hex));
 }
 
-fn oid(path: &Path, text: &str) -> Result<OidHex, Miss> {
-	if text.len() == ObjectFormat::Sha1.hex_len() && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-		// 40 digits always fit; the map_err only satisfies the fallible constructor.
+fn oid(path: &Path, text: &str, format: ObjectFormat) -> Result<OidHex, Miss> {
+	if text.len() == format.hex_len() && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+		// Every format's width fits; the map_err only satisfies the fallible constructor.
 		return OidHex::from(text).map_err(|_| Miss::new(path, MissReason::Malformed));
 	}
 	return Err(Miss::new(path, MissReason::Malformed));
@@ -134,6 +130,7 @@ mod tests {
 
 	use super::{common_dir, is_plain_branch, oid, packed_entry, read_head};
 	use crate::error::MissReason;
+	use crate::object_format::ObjectFormat;
 	use crate::testrepo::{commit, expect_err, git, new_repo};
 
 	const A: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -149,14 +146,26 @@ mod tests {
 	#[test]
 	fn oid_accepts_only_40_lowercase_hex() -> Result<(), String> {
 		let path: &Path = Path::new("x");
-		let got_oid = oid(path, A).map_err(|err| format!("oid(path, A): {err:?}"))?;
+		let got_oid = oid(path, A, ObjectFormat::Sha1).map_err(|err| format!("oid(path, A): {err:?}"))?;
 		assert_eq!(got_oid.as_str(), A);
-		let got_oid_2 = expect_err(oid(path, &A.to_uppercase()), "oid(path, &A.to_uppercase())")?;
+		let got_oid_2 = expect_err(oid(path, &A.to_uppercase(), ObjectFormat::Sha1), "oid(path, &A.to_uppercase())")?;
 		assert_eq!(got_oid_2.reason, MissReason::Malformed);
-		let got_oid_3 = expect_err(oid(path, &A[1..]), "oid(path, &A[1..])")?;
+		let got_oid_3 = expect_err(oid(path, &A[1..], ObjectFormat::Sha1), "oid(path, &A[1..])")?;
 		assert_eq!(got_oid_3.reason, MissReason::Malformed);
-		let got_oid_4 = expect_err(oid(path, &format!("{A}{A}")[..64]), "oid(path, 64 digits)")?;
+		let got_oid_4 = expect_err(oid(path, &format!("{A}{A}")[..64], ObjectFormat::Sha1), "oid(path, 64 digits)")?;
 		assert_eq!(got_oid_4.reason, MissReason::Malformed);
+		return Ok(());
+	}
+
+	// The width comes from the repo's object format: SHA-256 takes 64 digits and refuses 40.
+	#[test]
+	fn a_sha256_oid_is_64_lowercase_hex() -> Result<(), String> {
+		let path: &Path = Path::new("x");
+		let mut long: String = format!("{A}{A}");
+		long.truncate(64);
+		let got = oid(path, &long, ObjectFormat::Sha256).map_err(|err| format!("oid(path, 64 digits): {err:?}"))?;
+		assert_eq!(got.as_str(), long);
+		assert_eq!(expect_err(oid(path, A, ObjectFormat::Sha256), "oid(path, A)")?.reason, MissReason::Malformed);
 		return Ok(());
 	}
 
