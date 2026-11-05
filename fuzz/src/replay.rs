@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{head, index, index_roundtrip};
+use super::{check_pack, head, index, index_roundtrip, pack};
 
 // The fuzz crate's own root, which holds seeds/ and regressions/.
 fn fuzz_root() -> PathBuf {
@@ -53,6 +53,27 @@ fn fuzz_replay_index_roundtrip() -> Result<(), String> {
 #[test]
 fn fuzz_replay_head() -> Result<(), String> {
 	return replay_nonempty(&fuzz_root(), "head", head);
+}
+
+#[test]
+fn fuzz_replay_pack() -> Result<(), String> {
+	return replay_nonempty(&fuzz_root(), "pack", pack);
+}
+
+// The pack seeds are git's own REF and OFS delta packs: all but the one absent id must read whole.
+#[test]
+fn pack_seeds_read_whole_objects() -> Result<(), String> {
+	const ABSENT_SEEDS: usize = 1;
+	let dir: PathBuf = fuzz_root().join("seeds").join("pack");
+	let mut answered: usize = 0;
+	let mut total: usize = 0;
+	for entry in fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?.flatten() {
+		let bytes: Vec<u8> = fs::read(entry.path()).map_err(|e| format!("read {}: {e}", entry.path().display()))?;
+		answered += usize::from(check_pack(&bytes));
+		total += 1;
+	}
+	assert_eq!(answered + ABSENT_SEEDS, total, "{answered} of {total} pack seeds answered");
+	return Ok(());
 }
 
 mod tests {

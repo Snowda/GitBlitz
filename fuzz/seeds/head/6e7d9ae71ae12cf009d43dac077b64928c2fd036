@@ -1,0 +1,6 @@
+ref: refs/heads/main
+ÿabababababababababababababababababababababababababababababababab
+ÿÿ[core]
+	repositoryformatversion = 1
+[extensions]
+	objectformat = sha256
