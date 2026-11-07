@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::thread;
@@ -6,7 +6,7 @@ use std::thread;
 use crate::env::GitEnv;
 use crate::error::{Cause, Error, Miss};
 
-/// Runs `git <args> <extra>` in `dir` for an object command, with `input` on stdin, and returns stdout whole.
+/// Runs `git <args> <extra>` in `dir` for an object command, with `input` copied to stdin, and returns stdout whole.
 ///
 /// # Errors
 /// [`Error`] when git cannot start, fails, or its stdin cannot be written.
@@ -14,7 +14,7 @@ pub fn run_objects<'e>(
 	dir: &Path,
 	args: &'static [&'static str],
 	extra: impl IntoIterator<Item = &'e str>,
-	input: &[u8],
+	mut input: impl Read + Send,
 	env: GitEnv<'_>,
 	miss: Miss,
 ) -> Result<Vec<u8>, Error> {
@@ -33,7 +33,7 @@ pub fn run_objects<'e>(
 			let Some(mut pipe) = stdin else {
 				return Ok(0);
 			};
-			return io::copy(&mut &input[..], &mut pipe);
+			return io::copy(&mut input, &mut pipe);
 		});
 		let output: io::Result<Output> = child.wait_with_output();
 		let written: io::Result<u64> = writer.join().unwrap_or_else(|_| return Err(io::Error::other("stdin writer panicked")));
@@ -105,7 +105,7 @@ mod tests {
 	use super::{lossy, rev_parse, trim_in_place};
 	use crate::env::GitEnv;
 	use crate::error::{Cause, Error, Miss, MissReason};
-	use crate::testrepo::{expect_err, new_repo};
+	use crate::testrepo::{expect_err, new_repo, TestResult};
 
 	fn miss() -> Miss {
 		return Miss::new(Path::new("probe"), MissReason::NotARepo);
@@ -132,7 +132,7 @@ mod tests {
 	}
 
 	#[test]
-	fn success_strips_only_the_newline() -> Result<(), String> {
+	fn success_strips_only_the_newline() -> TestResult {
 		let repo = new_repo()?;
 		let got_rev_parse: String = rev_parse(repo.path(), &["rev-parse", "--is-inside-work-tree"], GitEnv::NONE, miss())
 			.map_err(|err| format!("rev_parse: {err:?}"))?;
@@ -141,7 +141,7 @@ mod tests {
 	}
 
 	#[test]
-	fn failure_carries_git_stderr_and_the_miss() -> Result<(), String> {
+	fn failure_carries_git_stderr_and_the_miss() -> TestResult {
 		let repo = new_repo()?;
 		let err: Error = expect_err(rev_parse(repo.path(), &["rev-parse", "--verify", "nope"], GitEnv::NONE, miss()), "rev_parse(--verify nope)")?;
 		let Cause::Exit { stderr, .. } = &err.cause else {
@@ -157,7 +157,7 @@ mod tests {
 
 	// git echoes a config value byte for byte, so a non-UTF-8 value reaches stdout unchanged.
 	#[test]
-	fn non_utf8_stdout_is_a_not_utf8_failure() -> Result<(), String> {
+	fn non_utf8_stdout_is_a_not_utf8_failure() -> TestResult {
 		let repo = new_repo()?;
 		let mut config = OpenOptions::new()
 			.append(true)
@@ -172,7 +172,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_missing_working_dir_is_a_spawn_failure() -> Result<(), String> {
+	fn a_missing_working_dir_is_a_spawn_failure() -> TestResult {
 		let repo = new_repo()?;
 		let err: Error = expect_err(rev_parse(&repo.path().join("gone"), &["rev-parse", "--git-dir"], GitEnv::NONE, miss()), "rev_parse(gone)")?;
 		assert!(matches!(err.cause, Cause::Spawn(_)), "{err:?}");

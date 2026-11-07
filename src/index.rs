@@ -4,6 +4,7 @@
 //! returns a [`Miss`] and the caller asks `git`. That covers a split index (`link`), a sparse index
 //! (`sdir`), an unmerged entry, and a truncated file.
 
+use std::ops::Range;
 use std::path::Path;
 
 use crate::error::{Miss, MissReason};
@@ -35,33 +36,68 @@ const UNSUPPORTED_EXTENSIONS: [&[u8; 4]; 2] = [b"link", b"sdir"];
 ///
 /// # Errors
 /// A [`Miss`] (naming `path`) for any layout this reader does not settle.
-pub fn tracked_paths(bytes: &[u8], path: &Path) -> Result<FileList, Miss> {
+pub fn tracked_paths(bytes: Vec<u8>, path: &Path) -> Result<FileList, Miss> {
 	return read_paths(bytes).map_err(|reason: MissReason| return Miss::new(path, reason));
 }
 
-// Every name goes into one buffer; a v4 name copies its kept prefix from the previous name's span.
-fn read_paths(bytes: &[u8]) -> Result<FileList, MissReason> {
-	let (version, count) = header(bytes)?;
+// Every name goes into one buffer: the index's own for v2/v3, a new one for v4.
+fn read_paths(bytes: Vec<u8>) -> Result<FileList, MissReason> {
+	let (version, count) = header(&bytes)?;
 	// A corrupt count must not reserve more than the file could hold.
 	let mut spans: Vec<Span> = Vec::with_capacity(count.min(bytes.len() / ENTRY_FIXED_LEN));
+	let names: Vec<u8> = if version == PATH_COMPRESSED_VERSION {
+		compressed_names(&bytes, count, &mut spans)?
+	} else {
+		compact_names(bytes, count, &mut spans)?
+	};
+	// Cannot fail: the spans tile the buffer and the loop checks each one as UTF-8.
+	let text: String = String::from_utf8(names).map_err(|_| MissReason::Malformed)?;
+	return Ok(FileList::from_parts(text, spans));
+}
+
+// v4: a name copies its kept prefix from the previous name's span, so the names need a buffer of their own.
+fn compressed_names(bytes: &[u8], count: usize, spans: &mut Vec<Span>) -> Result<Vec<u8>, MissReason> {
 	let mut names: Vec<u8> = Vec::new();
 	let mut pos: usize = HEADER_LEN;
 	let mut previous: usize = 0;
 	for _ in 0..count {
 		let start: usize = names.len();
-		pos = entry(bytes, pos, version, &mut names, previous)?;
-		str::from_utf8(names.get(start..).unwrap_or_default()).map_err(|_| MissReason::Malformed)?;
-		spans.push(Span::new(start, names.len()));
+		pos = compressed_name(bytes, pos, &mut names, previous)?;
+		spans.push(utf8_span(&names, start, names.len())?);
 		previous = start;
 	}
-	match extensions_are_supported(bytes, pos) {
-		Some(true) => {}
-		Some(false) => return Err(MissReason::UnsupportedIndex),
-		None => return Err(MissReason::Malformed),
+	check_extensions(bytes, pos)?;
+	return Ok(names);
+}
+
+// v2/v3: each name moves to the front of `bytes`. It lies past every name before it, so a move never overwrites unread bytes.
+fn compact_names(mut bytes: Vec<u8>, count: usize, spans: &mut Vec<Span>) -> Result<Vec<u8>, MissReason> {
+	let mut pos: usize = HEADER_LEN;
+	let mut written: usize = 0;
+	for _ in 0..count {
+		let (name, next) = padded_name(&bytes, pos)?;
+		let len: usize = name.len();
+		bytes.copy_within(name, written);
+		spans.push(utf8_span(&bytes, written, written + len)?);
+		(written, pos) = (written + len, next);
 	}
-	// Cannot fail: the spans tile the buffer and the loop checks each one as UTF-8.
-	let text: String = String::from_utf8(names).map_err(|_| MissReason::Malformed)?;
-	return Ok(FileList::from_parts(text, spans));
+	check_extensions(&bytes, pos)?;
+	bytes.truncate(written);
+	bytes.shrink_to_fit();
+	return Ok(bytes);
+}
+
+fn utf8_span(names: &[u8], start: usize, end: usize) -> Result<Span, MissReason> {
+	str::from_utf8(names.get(start..end).unwrap_or_default()).map_err(|_| return MissReason::Malformed)?;
+	return Ok(Span::new(start, end));
+}
+
+fn check_extensions(bytes: &[u8], pos: usize) -> Result<(), MissReason> {
+	return match extensions_are_supported(bytes, pos) {
+		Some(true) => Ok(()),
+		Some(false) => Err(MissReason::UnsupportedIndex),
+		None => Err(MissReason::Malformed),
+	};
 }
 
 fn header(bytes: &[u8]) -> Result<(u32, usize), MissReason> {
@@ -76,24 +112,21 @@ fn header(bytes: &[u8]) -> Result<(u32, usize), MissReason> {
 	return Ok((version, usize::try_from(count).map_err(|_| MissReason::Malformed)?));
 }
 
-// The entry at `start`: its path goes on the end of `names`, whose previous path starts at `previous`.
-// The return value is where the next entry starts.
-fn entry(bytes: &[u8], start: usize, version: u32, names: &mut Vec<u8>, previous: usize) -> Result<usize, MissReason> {
+// The flags of the entry at `start` and where its name starts; an entry git must list itself is a Miss.
+fn name_start(bytes: &[u8], start: usize) -> Result<(usize, u16), MissReason> {
 	let mode: u32 = be_u32(bytes, start + MODE_OFFSET).ok_or(MissReason::Malformed)?;
 	let flags: u16 = be_u16(bytes, start + ENTRY_FIXED_LEN - 2).ok_or(MissReason::Malformed)?;
 	if flags & FLAG_STAGE_MASK != 0 || mode == SPARSE_DIR_MODE {
 		return Err(MissReason::UnsupportedIndex);
 	}
 	let extended: usize = if flags & FLAG_EXTENDED == 0 { 0 } else { EXTENDED_FLAGS_LEN };
-	let pos: usize = start + ENTRY_FIXED_LEN + extended;
-	if version == PATH_COMPRESSED_VERSION {
-		return compressed_name(bytes, pos, names, previous);
-	}
-	return padded_name(bytes, start, pos, flags, names);
+	return Ok((start + ENTRY_FIXED_LEN + extended, flags));
 }
 
 // v4: the previous path less `strip` bytes from its end, then the suffix; the cut may fall inside a character.
-fn compressed_name(bytes: &[u8], pos: usize, names: &mut Vec<u8>, previous: usize) -> Result<usize, MissReason> {
+// The path goes on the end of `names`, whose previous path starts at `previous`; returns where the next entry starts.
+fn compressed_name(bytes: &[u8], start: usize, names: &mut Vec<u8>, previous: usize) -> Result<usize, MissReason> {
+	let (pos, _) = name_start(bytes, start)?;
 	let (strip, used) = varint(bytes, pos).ok_or(MissReason::Malformed)?;
 	let suffix: &[u8] = until_nul(bytes, pos + used).ok_or(MissReason::Malformed)?;
 	let kept: usize = (names.len() - previous).checked_sub(strip).ok_or(MissReason::Malformed)?;
@@ -103,16 +136,17 @@ fn compressed_name(bytes: &[u8], pos: usize, names: &mut Vec<u8>, previous: usiz
 }
 
 // v2/v3: the flags hold the name length (or 0xFFF for a longer, NUL-terminated name); NUL bytes pad the entry.
-fn padded_name(bytes: &[u8], start: usize, pos: usize, flags: u16, names: &mut Vec<u8>) -> Result<usize, MissReason> {
+// Returns where the name lies in `bytes` and where the next entry starts.
+fn padded_name(bytes: &[u8], start: usize) -> Result<(Range<usize>, usize), MissReason> {
+	let (pos, flags) = name_start(bytes, start)?;
 	let name_len: usize = usize::from(flags & NAME_LEN_MASK);
-	let found: &[u8] = if name_len < usize::from(NAME_LEN_MASK) {
-		bytes.get(pos..pos + name_len).ok_or(MissReason::Malformed)?
+	let len: usize = if name_len < usize::from(NAME_LEN_MASK) {
+		bytes.get(pos..pos + name_len).ok_or(MissReason::Malformed)?.len()
 	} else {
-		until_nul(bytes, pos).ok_or(MissReason::Malformed)?
+		until_nul(bytes, pos).ok_or(MissReason::Malformed)?.len()
 	};
-	names.extend_from_slice(found);
 	let name_offset: usize = pos - start;
-	return Ok(start + (name_offset + found.len() + ENTRY_ALIGN) / ENTRY_ALIGN * ENTRY_ALIGN);
+	return Ok((pos..pos + len, start + (name_offset + len + ENTRY_ALIGN) / ENTRY_ALIGN * ENTRY_ALIGN));
 }
 
 // The extension blocks after the entries. `Some(false)` when one is a kind this reader refuses.
@@ -222,7 +256,7 @@ mod tests {
 
 	// The reader keeps index order; `read_files` sorts.
 	fn paths(bytes: &[u8]) -> Result<Vec<String>, MissReason> {
-		let files: FileList = tracked_paths(bytes, Path::new("index")).map_err(|m| m.reason)?;
+		let files: FileList = tracked_paths(bytes.to_vec(), Path::new("index")).map_err(|m| m.reason)?;
 		return Ok(files.texts().map(String::from).collect());
 	}
 
@@ -269,6 +303,15 @@ mod tests {
 		assert_eq!(paths(&index(2, &[named(&long), named("z.rs")], &[])), owned(&[&long, "z.rs"]));
 	}
 
+	// Names longer than the fixed part overlap their own move to the front, and a later name moves over an earlier entry.
+	#[test]
+	fn names_that_overlap_their_move_to_the_front_read_intact() {
+		let long: String = format!("{}a.rs", "x/".repeat(200));
+		let longer: String = format!("{}b.rs", "y/".repeat(5000));
+		let entries: [Vec<u8>; 4] = [named("a"), named(&long), entry(REGULAR, 0x4000 | 4, b"c.rs"), named(&longer)];
+		assert_eq!(paths(&index(3, &entries, &extension(b"TREE", b"\0\0"))), owned(&["a", &long, "c.rs", &longer]));
+	}
+
 	// v3's extended flag puts two bytes before the name; skipping them keeps the name and the next entry intact.
 	#[test]
 	fn a_v3_extended_entry_skips_its_extra_flag_bytes() {
@@ -312,7 +355,7 @@ mod tests {
 	#[test]
 	fn a_file_that_is_not_an_index_misses_and_does_not_panic() {
 		let probe: &Path = Path::new("index");
-		let reason = |bytes: &[u8]| tracked_paths(bytes, probe).err().map(|m| m.reason);
+		let reason = |bytes: &[u8]| tracked_paths(bytes.to_vec(), probe).err().map(|m| m.reason);
 		assert_eq!(reason(b"XXXX\0\0\0\x02\0\0\0\0"), Some(MissReason::Malformed));
 		assert_eq!(reason(b"DIRC\0\0\0\x09\0\0\0\0"), Some(MissReason::UnsupportedIndex));
 		assert_eq!(reason(b"DIRC\0\0\0\x02\0\0\0\x05"), Some(MissReason::Malformed), "entries promised, none present");

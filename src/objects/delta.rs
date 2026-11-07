@@ -48,14 +48,38 @@ fn varint(bytes: &[u8]) -> Result<(u64, usize), BadDelta> {
 }
 
 /// The object `delta` makes from `base`; [`BadDelta`] wherever git's `patch_delta` refuses.
+#[cfg(test)]
 pub fn apply(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, BadDelta> {
+	let mut out: Vec<u8> = Vec::new();
+	apply_into(base, delta, &mut out)?;
+	return Ok(out);
+}
+
+/// [`apply`] into `out`, replacing what it held but keeping its capacity.
+pub fn apply_into(base: &[u8], delta: &[u8], out: &mut Vec<u8>) -> Result<(), BadDelta> {
+	out.clear();
+	return apply_append(base, delta, out);
+}
+
+/// [`apply`] onto the end of `out`; on an error, `out` keeps only what it held before.
+pub fn apply_append(base: &[u8], delta: &[u8], out: &mut Vec<u8>) -> Result<(), BadDelta> {
+	let start: usize = out.len();
+	let applied: Result<(), BadDelta> = append_result(base, delta, out, start);
+	if applied.is_err() {
+		out.truncate(start);
+	}
+	return applied;
+}
+
+// The result of `delta` on `base`, written after the `start` bytes `out` already holds.
+fn append_result(base: &[u8], delta: &[u8], out: &mut Vec<u8>, start: usize) -> Result<(), BadDelta> {
 	let header: Sizes = sizes(delta)?;
 	if u64::try_from(base.len()).ok() != Some(header.base) {
 		return Err(BadDelta);
 	}
 	let size: usize = usize::try_from(header.result).map_err(|_| BadDelta)?;
-	let mut out: Vec<u8> = Vec::new();
-	out.try_reserve_exact(size).map_err(|_| BadDelta)?;
+	let end: usize = start.checked_add(size).ok_or(BadDelta)?;
+	out.try_reserve(size).map_err(|_| BadDelta)?;
 	let mut ops: &[u8] = delta.get(header.len..).unwrap_or_default();
 	while let Some((&cmd, rest)) = ops.split_first() {
 		ops = rest;
@@ -70,15 +94,15 @@ pub fn apply(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, BadDelta> {
 		} else {
 			return Err(BadDelta);
 		};
-		if piece.len() > size - out.len() {
+		if piece.len() > end - out.len() {
 			return Err(BadDelta);
 		}
 		out.extend_from_slice(piece);
 	}
-	if out.len() != size {
+	if out.len() != end {
 		return Err(BadDelta);
 	}
-	return Ok(out);
+	return Ok(());
 }
 
 // A copy's base offset and length: each set flag bit pulls one little-endian byte from `ops`.
@@ -102,7 +126,7 @@ fn copy_args(cmd: u8, ops: &[u8]) -> Result<(usize, usize, &[u8]), BadDelta> {
 
 #[cfg(test)]
 mod tests {
-	use super::{apply, sizes, BadDelta, Sizes, HEADER_MAX};
+	use super::{apply, apply_append, apply_into, sizes, BadDelta, Sizes, HEADER_MAX};
 
 	// Base "hello world", result "hello there world": copy 6, insert "there ", copy 5 from offset 6.
 	const BASE: &[u8] = b"hello world";
@@ -112,6 +136,31 @@ mod tests {
 	fn copies_and_inserts_build_the_result() {
 		assert_eq!(sizes(DELTA), Ok(Sizes { base: 11, result: 17, len: 2 }));
 		assert_eq!(apply(BASE, DELTA).as_deref(), Ok(b"hello there world".as_slice()));
+	}
+
+	// A reused buffer keeps its capacity but none of its old bytes, longer or shorter than the result.
+	#[test]
+	fn apply_into_replaces_what_the_buffer_held() -> Result<(), BadDelta> {
+		let mut out: Vec<u8> = b"stale bytes that are longer than any result".to_vec();
+		let capacity: usize = out.capacity();
+		apply_into(BASE, DELTA, &mut out)?;
+		assert_eq!((out.as_slice(), out.capacity()), (b"hello there world".as_slice(), capacity));
+		apply_into(BASE, &[11, 3, 0x90, 3], &mut out)?;
+		assert_eq!(out, b"hel", "a copy of the first 3 base bytes");
+		assert_eq!(apply_into(BASE, &[11, 1, 0], &mut out), Err(BadDelta));
+		return Ok(());
+	}
+
+	// The result lands after what the buffer held; a refused delta, even one cut short mid-write, leaves exactly that.
+	#[test]
+	fn apply_append_keeps_the_prefix_whether_or_not_it_works() -> Result<(), BadDelta> {
+		let mut out: Vec<u8> = b"head:".to_vec();
+		apply_append(BASE, DELTA, &mut out)?;
+		assert_eq!(out, b"head:hello there world");
+		assert_eq!(apply_append(BASE, &[11, 3, 2, b'a', b'b'], &mut out), Err(BadDelta), "result shorter than declared");
+		assert_eq!(apply_append(BASE, &[11, 1, 0], &mut out), Err(BadDelta), "opcode 0");
+		assert_eq!(out, b"head:hello there world");
+		return Ok(());
 	}
 
 	#[test]

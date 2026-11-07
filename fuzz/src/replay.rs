@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{check_pack, head, index, index_roundtrip, pack};
+use super::{check_pack, head, index, index_roundtrip, pack, TestResult};
 
 // The fuzz crate's own root, which holds seeds/ and regressions/.
 fn fuzz_root() -> PathBuf {
@@ -12,7 +12,7 @@ fn fuzz_root() -> PathBuf {
 }
 
 // Run `harness` over each non-hidden file in seeds/<target>/ and regressions/<target>/ under `root`. Returns the count.
-fn replay(root: &Path, target: &str, harness: fn(&[u8])) -> Result<usize, String> {
+fn replay(root: &Path, target: &str, harness: fn(&[u8])) -> TestResult<usize> {
 	let mut ran: usize = 0;
 	for dir in ["seeds", "regressions"] {
 		let Ok(entries) = fs::read_dir(root.join(dir).join(target)) else {
@@ -32,7 +32,7 @@ fn replay(root: &Path, target: &str, harness: fn(&[u8])) -> Result<usize, String
 }
 
 // Replay one target and fail if its seed directory held nothing to run.
-fn replay_nonempty(root: &Path, target: &str, harness: fn(&[u8])) -> Result<(), String> {
+fn replay_nonempty(root: &Path, target: &str, harness: fn(&[u8])) -> TestResult {
 	return match replay(root, target, harness) {
 		Ok(0) => Err(format!("fuzz/seeds/{target}/ holds no seed inputs")),
 		Ok(_) => Ok(()),
@@ -41,28 +41,28 @@ fn replay_nonempty(root: &Path, target: &str, harness: fn(&[u8])) -> Result<(), 
 }
 
 #[test]
-fn fuzz_replay_index() -> Result<(), String> {
+fn fuzz_replay_index() -> TestResult {
 	return replay_nonempty(&fuzz_root(), "index", index);
 }
 
 #[test]
-fn fuzz_replay_index_roundtrip() -> Result<(), String> {
+fn fuzz_replay_index_roundtrip() -> TestResult {
 	return replay_nonempty(&fuzz_root(), "index_roundtrip", index_roundtrip);
 }
 
 #[test]
-fn fuzz_replay_head() -> Result<(), String> {
+fn fuzz_replay_head() -> TestResult {
 	return replay_nonempty(&fuzz_root(), "head", head);
 }
 
 #[test]
-fn fuzz_replay_pack() -> Result<(), String> {
+fn fuzz_replay_pack() -> TestResult {
 	return replay_nonempty(&fuzz_root(), "pack", pack);
 }
 
 // The pack seeds are git's own REF and OFS delta packs: all but the one absent id must read whole.
 #[test]
-fn pack_seeds_read_whole_objects() -> Result<(), String> {
+fn pack_seeds_read_whole_objects() -> TestResult {
 	const ABSENT_SEEDS: usize = 1;
 	let dir: PathBuf = fuzz_root().join("seeds").join("pack");
 	let mut answered: usize = 0;
@@ -83,7 +83,7 @@ mod tests {
 
 	use tempfile::{tempdir, TempDir};
 
-	use super::{replay, replay_nonempty};
+	use super::{replay, replay_nonempty, TestResult};
 
 	const SKIPPED: &[u8] = b"skipped";
 
@@ -102,7 +102,7 @@ mod tests {
 	fn a_target_with_no_inputs_is_an_error_naming_it() -> IoResult<()> {
 		let root: TempDir = tempdir()?;
 		assert_eq!(replay(root.path(), "absent", refuse_skipped), Ok(0));
-		let got: Result<(), String> = replay_nonempty(root.path(), "absent", refuse_skipped);
+		let got: TestResult = replay_nonempty(root.path(), "absent", refuse_skipped);
 		assert_eq!(got, Err(String::from("fuzz/seeds/absent/ holds no seed inputs")));
 		return Ok(());
 	}
@@ -140,7 +140,7 @@ mod tests {
 		let root: TempDir = tempdir()?;
 		let locked: PathBuf = write(&root.path().join("seeds/t"), "locked", b"x")?;
 		let hold: File = OpenOptions::new().read(true).share_mode(0).open(&locked)?;
-		let got: Result<(), String> = replay_nonempty(root.path(), "t", refuse_skipped);
+		let got: TestResult = replay_nonempty(root.path(), "t", refuse_skipped);
 		drop(hold);
 		assert!(matches!(&got, Err(text) if text.starts_with("read ") && text.contains("locked")), "{got:?}");
 		return Ok(());

@@ -3,22 +3,7 @@
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::path::Path;
 
-/// Where one path sits in the buffer of a [`FileList`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Span {
-	start: usize,
-	end: usize,
-}
-
-impl Span {
-	pub(crate) const fn new(start: usize, end: usize) -> Self {
-		return Self { start, end };
-	}
-
-	fn text(self, text: &str) -> &str {
-		return text.get(self.start..self.end).unwrap_or_default();
-	}
-}
+pub(crate) use crate::span::Span;
 
 /// Paths relative to the listed directory, with `/` separators, sorted as [`Path`]s.
 #[derive(Default)]
@@ -114,9 +99,15 @@ impl PartialEq for FileList {
 
 impl Eq for FileList {}
 
-impl<P: AsRef<Path>> PartialEq<Vec<P>> for FileList {
-	fn eq(&self, other: &Vec<P>) -> bool {
+impl<P: AsRef<Path>> PartialEq<[P]> for FileList {
+	fn eq(&self, other: &[P]) -> bool {
 		return self.iter().eq(other.iter().map(AsRef::as_ref));
+	}
+}
+
+impl<P: AsRef<Path>, const N: usize> PartialEq<[P; N]> for FileList {
+	fn eq(&self, other: &[P; N]) -> bool {
+		return *self == other[..];
 	}
 }
 
@@ -132,14 +123,10 @@ mod tests {
 
 	use super::{FileList, Span};
 
-	fn listed(files: &FileList) -> Vec<&str> {
-		return files.texts().collect();
-	}
-
 	#[test]
 	fn nul_separated_text_skips_empty_parts_and_keeps_its_order() {
 		let files: FileList = FileList::from_nul_separated(String::from("b.rs\0\0a.rs\0"));
-		assert_eq!(listed(&files), ["b.rs", "a.rs"]);
+		assert_eq!(files, ["b.rs", "a.rs"]);
 		assert_eq!((files.len(), files.is_empty()), (2, false));
 		assert!(FileList::from_nul_separated(String::new()).is_empty(), "no text lists nothing");
 	}
@@ -149,26 +136,26 @@ mod tests {
 	fn sort_uses_path_order_not_string_order() {
 		let mut files: FileList = FileList::from_nul_separated(String::from("a.b\0a/b\0a\0"));
 		files.sort();
-		assert_eq!(listed(&files), ["a", "a/b", "a.b"]);
-		let mut strings: Vec<&str> = vec!["a.b", "a/b", "a"];
+		assert_eq!(files, ["a", "a/b", "a.b"]);
+		let mut strings: [&str; 3] = ["a.b", "a/b", "a"];
 		strings.sort_unstable();
-		assert_ne!(listed(&files), strings, "the two orders differ for this input");
+		assert_ne!(files, strings, "the two orders differ for this input");
 	}
 
 	#[test]
 	fn dedup_drops_only_adjacent_equal_paths() {
 		let mut files: FileList = FileList::from_nul_separated(String::from("a\0a\0b\0a\0"));
 		files.dedup();
-		assert_eq!(listed(&files), ["a", "b", "a"]);
+		assert_eq!(files, ["a", "b", "a"]);
 	}
 
 	#[test]
 	fn retain_under_keeps_the_subtree_relative_to_the_prefix() {
 		let mut files: FileList = FileList::from_nul_separated(String::from("sub/a.rs\0top.rs\0sub/deep/b.rs\0subway.rs\0"));
 		files.retain_under("sub/");
-		assert_eq!(listed(&files), ["a.rs", "deep/b.rs"]);
+		assert_eq!(files, ["a.rs", "deep/b.rs"]);
 		files.retain_under("");
-		assert_eq!(listed(&files), ["a.rs", "deep/b.rs"], "an empty prefix keeps everything unchanged");
+		assert_eq!(files, ["a.rs", "deep/b.rs"], "an empty prefix keeps everything unchanged");
 	}
 
 	#[test]
@@ -178,9 +165,10 @@ mod tests {
 		files.push_slashed("dir\\sub\\x.rs");
 		assert_eq!(files.last(), Some("dir/sub/x.rs"));
 		files.pop();
-		assert_eq!((listed(&files), files.last()), (vec!["kept.rs"], Some("kept.rs")));
+		assert_eq!(files, ["kept.rs"]);
+		assert_eq!(files.last(), Some("kept.rs"));
 		files.push_slashed("next.rs");
-		assert_eq!(listed(&files), ["kept.rs", "next.rs"], "pop also gave back the popped path's text");
+		assert_eq!(files, ["kept.rs", "next.rs"], "pop also gave back the popped path's text");
 		files.pop();
 		files.pop();
 		files.pop();
@@ -193,9 +181,10 @@ mod tests {
 		let parts: FileList = FileList::from_parts(String::from("xa.rsb.rs"), vec![Span::new(1, 5), Span::new(5, 9)]);
 		let text: FileList = FileList::from_nul_separated(String::from("a.rs\0b.rs"));
 		assert_eq!(parts, text);
-		assert_eq!(parts, vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")]);
-		assert_ne!(parts, vec![PathBuf::from("a.rs")], "a shorter list differs");
-		assert_ne!(parts, vec!["a.rs", "c.rs"], "a different path differs");
+		assert_eq!(parts, [PathBuf::from("a.rs"), PathBuf::from("b.rs")]);
+		assert_eq!(parts, *[Path::new("a.rs"), Path::new("b.rs")].as_slice(), "a slice compares like an array");
+		assert_ne!(parts, [Path::new("a.rs")], "a shorter list differs");
+		assert_ne!(parts, ["a.rs", "c.rs"], "a different path differs");
 		assert_ne!(parts, FileList::from_nul_separated(String::from("b.rs\0a.rs")), "order matters");
 		assert_eq!(parts.iter().next_back(), Some(Path::new("b.rs")));
 		assert_eq!(format!("{parts:?}"), r#"["a.rs", "b.rs"]"#);

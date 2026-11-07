@@ -115,18 +115,26 @@ pub fn inflate(input: &mut Input<'_>, out: &mut [u8]) -> Result<Fill, InflateErr
 }
 
 /// Inflates a stream that must hold exactly `size` bytes; `Corrupt` when it is shorter or longer.
+#[cfg(test)]
 pub fn inflate_exact(input: &mut Input<'_>, size: usize) -> Result<Vec<u8>, InflateError> {
-	// One spare byte shows a stream longer than declared without relying on how the inflater reports a full buffer.
 	let mut out: Vec<u8> = Vec::new();
-	out.try_reserve_exact(size + 1).map_err(|_| InflateError::Io(ErrorKind::OutOfMemory))?;
-	out.resize(size + 1, 0);
-	return match inflate(input, &mut out)? {
-		Fill::Ended(len) if len == size => {
-			out.truncate(size);
-			Ok(out)
-		}
-		_ => Err(InflateError::Corrupt),
-	};
+	inflate_exact_append(input, size, &mut out)?;
+	return Ok(out);
+}
+
+/// The `size` bytes of the stream onto the end of `out`, with the errors of `inflate_exact`; on an error, `out` keeps only what it held.
+pub fn inflate_exact_append(input: &mut Input<'_>, size: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
+	// One spare byte shows a stream longer than declared without relying on how the inflater reports a full buffer.
+	let start: usize = out.len();
+	out.try_reserve(size + 1).map_err(|_| InflateError::Io(ErrorKind::OutOfMemory))?;
+	out.resize(start + size + 1, 0);
+	let filled: Result<Fill, InflateError> = inflate(input, out.get_mut(start..).unwrap_or_default());
+	if filled == Ok(Fill::Ended(size)) {
+		out.truncate(start + size);
+		return Ok(());
+	}
+	out.truncate(start);
+	return filled.and(Err(InflateError::Corrupt));
 }
 
 #[cfg(test)]
@@ -137,7 +145,7 @@ mod tests {
 	use miniz_oxide::deflate::compress_to_vec_zlib;
 	use tempfile::{tempdir, TempDir};
 
-	use super::{inflate, inflate_exact, Fill, InflateError, Input, CHUNK};
+	use super::{inflate, inflate_exact, inflate_exact_append, Fill, InflateError, Input, CHUNK};
 
 	const LEVEL: u8 = 6;
 
@@ -160,6 +168,19 @@ mod tests {
 		assert_eq!(got.as_deref(), Ok(body.as_slice()));
 		assert_eq!(inflate_exact(&mut Input::at(&file, 4)?, body.len() - 1), Err(InflateError::Corrupt), "a longer stream");
 		assert_eq!(inflate_exact(&mut Input::at(&file, 4)?, body.len() + 1), Err(InflateError::Corrupt), "a shorter stream");
+		return Ok(());
+	}
+
+	// An append lands after what the buffer held, and one that fails leaves exactly that.
+	#[test]
+	fn an_append_keeps_the_prefix_whether_or_not_it_works() -> IoResult<()> {
+		let (_dir, file) = file_with(&compress_to_vec_zlib(b"body", LEVEL))?;
+		let mut out: Vec<u8> = b"head:".to_vec();
+		assert_eq!(inflate_exact_append(&mut Input::at(&file, 0)?, 4, &mut out), Ok(()));
+		assert_eq!(out, b"head:body");
+		assert_eq!(inflate_exact_append(&mut Input::at(&file, 0)?, 3, &mut out), Err(InflateError::Corrupt), "a longer stream");
+		assert_eq!(inflate_exact_append(&mut Input::at(&file, 0)?, 5, &mut out), Err(InflateError::Corrupt), "a shorter stream");
+		assert_eq!(out, b"head:body");
 		return Ok(());
 	}
 

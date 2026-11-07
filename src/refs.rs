@@ -1,5 +1,5 @@
-use std::fs;
 use std::io::{Error as IoError, ErrorKind};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use arrayvec::ArrayString;
@@ -7,6 +7,7 @@ use arrayvec::ArrayString;
 use crate::config::{self, RepoConfig, CONFIG_FILE};
 use crate::discover::{locate, no_head, HEAD_FILE};
 use crate::error::{Miss, MissReason};
+use crate::lines::scan_text_lines;
 use crate::object_format::ObjectFormat;
 use crate::small_file::{read_small, SmallBuf, SMALL_FILE_MAX};
 
@@ -80,23 +81,23 @@ fn branch_oid(common: &Path, refname: &str, format: ObjectFormat) -> Result<OidH
 
 fn packed_oid(common: &Path, refname: &str, loose: &Path, format: ObjectFormat) -> Result<OidHex, Miss> {
 	let path: PathBuf = common.join(PACKED_REFS_FILE);
-	let text: String = match fs::read_to_string(&path) {
-		Ok(text) => text,
-		Err(err) if err.kind() == ErrorKind::NotFound => return Err(Miss::new(loose, MissReason::Unborn)),
-		Err(err) => return Err(Miss::io(&path, &err)),
-	};
-	return match packed_entry(&text, refname) {
-		Some(hex) => oid(&path, hex, format),
-		None => Err(Miss::new(loose, MissReason::Unborn)),
+	let found = scan_text_lines(&path, |line: &str| {
+		return packed_entry(line, refname).map_or(ControlFlow::Continue(()), |hex: &str| return ControlFlow::Break(oid(&path, hex, format)));
+	});
+	return match found {
+		Ok(Some(oid)) => oid,
+		Ok(None) => Err(Miss::new(loose, MissReason::Unborn)),
+		Err(err) if err.kind() == ErrorKind::NotFound => Err(Miss::new(loose, MissReason::Unborn)),
+		Err(err) => Err(Miss::io(&path, &err)),
 	};
 }
 
 // packed-refs: `#` header, `<oid> <refname>` entries, `^<oid>` peeled tags under the entry they peel.
-fn packed_entry<'a>(text: &'a str, refname: &str) -> Option<&'a str> {
-	return text
-		.lines()
-		.filter(|line| !line.starts_with('#') && !line.starts_with('^'))
-		.find_map(|line| line.split_once(' ').filter(|&(_, name)| name == refname).map(|(hex, _)| hex));
+fn packed_entry<'a>(line: &'a str, refname: &str) -> Option<&'a str> {
+	if line.starts_with(['#', '^']) {
+		return None;
+	}
+	return line.split_once(' ').filter(|&(_, name)| return name == refname).map(|(hex, _)| return hex);
 }
 
 fn oid(path: &Path, text: &str, format: ObjectFormat) -> Result<OidHex, Miss> {
@@ -131,20 +132,49 @@ mod tests {
 	use super::{common_dir, is_plain_branch, oid, packed_entry, read_head};
 	use crate::error::MissReason;
 	use crate::object_format::ObjectFormat;
-	use crate::testrepo::{commit, expect_err, git, new_repo};
+	use crate::testrepo::{commit, expect_err, git, new_repo, rev, TestResult};
 
 	const A: &str = "0123456789abcdef0123456789abcdef01234567";
 
 	#[test]
 	fn packed_entry_skips_header_and_peeled_lines() {
-		let text: String = format!("# pack-refs with: peeled fully-peeled sorted\n^{A}\n{A} refs/heads/main\n");
-		assert_eq!(packed_entry(&text, "refs/heads/main"), Some(A));
-		assert_eq!(packed_entry(&text, "refs/heads/other"), None);
-		assert_eq!(packed_entry(&format!("^{A} refs/heads/main\n"), "refs/heads/main"), None);
+		let entry: String = format!("{A} refs/heads/main");
+		assert_eq!(packed_entry(&entry, "refs/heads/main"), Some(A));
+		assert_eq!(packed_entry(&entry, "refs/heads/other"), None);
+		assert_eq!(packed_entry(&format!("^{A} refs/heads/main"), "refs/heads/main"), None);
+		assert_eq!(packed_entry("# pack-refs with: refs/heads/main", "with:"), None, "the header is no entry");
+	}
+
+	// With no loose ref left, the oid comes from the packed-refs that `git pack-refs` writes.
+	#[test]
+	fn a_packed_branch_reads_its_oid() -> TestResult {
+		let repo = new_repo()?;
+		commit(repo.path(), "one")?;
+		git(repo.path(), &["pack-refs", "--all"])?;
+		let heads: usize = fs::read_dir(repo.path().join(".git/refs/heads")).map_err(|err| format!("{err:?}"))?.count();
+		assert_eq!(heads, 0, "pack-refs pruned the loose branch");
+		let got = read_head(repo.path()).map_err(|err| format!("read_head: {err:?}"))?;
+		assert_eq!(got.as_str(), rev(repo.path(), "HEAD")?.as_str());
+		return Ok(());
+	}
+
+	// A packed-refs that is not UTF-8 anywhere is an I/O miss, as `read_to_string` made it.
+	#[test]
+	fn non_utf8_packed_refs_is_an_io_miss() -> TestResult {
+		let repo = new_repo()?;
+		commit(repo.path(), "one")?;
+		git(repo.path(), &["pack-refs", "--all"])?;
+		let packed: PathBuf = repo.path().join(".git/packed-refs");
+		let mut bytes: Vec<u8> = fs::read(&packed).map_err(|err| format!("read packed-refs: {err:?}"))?;
+		bytes.extend_from_slice(b"0000000000000000000000000000000000000000 refs/tags/caf\xe9\n");
+		fs::write(&packed, bytes).map_err(|err| format!("write packed-refs: {err:?}"))?;
+		let miss = read_head(repo.path()).err();
+		assert_eq!(miss.map(|m| return m.reason), Some(MissReason::Io(ErrorKind::InvalidData)));
+		return Ok(());
 	}
 
 	#[test]
-	fn oid_accepts_only_40_lowercase_hex() -> Result<(), String> {
+	fn oid_accepts_only_40_lowercase_hex() -> TestResult {
 		let path: &Path = Path::new("x");
 		let got_oid = oid(path, A, ObjectFormat::Sha1).map_err(|err| format!("oid(path, A): {err:?}"))?;
 		assert_eq!(got_oid.as_str(), A);
@@ -159,7 +189,7 @@ mod tests {
 
 	// The width comes from the repo's object format: SHA-256 takes 64 digits and refuses 40.
 	#[test]
-	fn a_sha256_oid_is_64_lowercase_hex() -> Result<(), String> {
+	fn a_sha256_oid_is_64_lowercase_hex() -> TestResult {
 		let path: &Path = Path::new("x");
 		let mut long: String = format!("{A}{A}");
 		long.truncate(64);
@@ -189,7 +219,7 @@ mod tests {
 	}
 
 	#[test]
-	fn empty_commondir_is_malformed() -> Result<(), String> {
+	fn empty_commondir_is_malformed() -> TestResult {
 		let repo = new_repo()?;
 		let git_dir: PathBuf = repo.path().join(".git");
 		fs::write(git_dir.join("commondir"), "\n").map_err(|err| format!("write commondir: {err:?}"))?;
@@ -199,7 +229,7 @@ mod tests {
 	}
 
 	#[test]
-	fn head_on_a_non_branch_ref_is_unsupported() -> Result<(), String> {
+	fn head_on_a_non_branch_ref_is_unsupported() -> TestResult {
 		let repo = new_repo()?;
 		commit(repo.path(), "one")?;
 		git(repo.path(), &["symbolic-ref", "HEAD", "refs/remotes/origin/main"])?;
@@ -210,7 +240,7 @@ mod tests {
 	}
 
 	#[test]
-	fn packed_refs_without_the_branch_is_unborn() -> Result<(), String> {
+	fn packed_refs_without_the_branch_is_unborn() -> TestResult {
 		let repo = new_repo()?;
 		commit(repo.path(), "one")?;
 		git(repo.path(), &["pack-refs", "--all"])?;
@@ -226,7 +256,7 @@ mod tests {
 
 	// A `commondir` that does not read as a file is an I/O miss, not a repo without one.
 	#[test]
-	fn a_commondir_directory_is_an_io_miss() -> Result<(), String> {
+	fn a_commondir_directory_is_an_io_miss() -> TestResult {
 		let repo = new_repo()?;
 		let git_dir: PathBuf = repo.path().join(".git");
 		fs::create_dir(git_dir.join("commondir")).map_err(|err| format!("mkdir commondir: {err:?}"))?;
@@ -237,7 +267,7 @@ mod tests {
 
 	// An unreadable `packed-refs` must not pass for an unborn branch.
 	#[test]
-	fn a_packed_refs_directory_is_an_io_miss_not_unborn() -> Result<(), String> {
+	fn a_packed_refs_directory_is_an_io_miss_not_unborn() -> TestResult {
 		let repo = new_repo()?;
 		fs::create_dir(repo.path().join(".git/packed-refs")).map_err(|err| format!("mkdir packed-refs: {err:?}"))?;
 		let miss = read_head(repo.path()).err();
@@ -246,7 +276,7 @@ mod tests {
 	}
 
 	#[test]
-	fn missing_config_is_an_io_miss() -> Result<(), String> {
+	fn missing_config_is_an_io_miss() -> TestResult {
 		let repo = new_repo()?;
 		commit(repo.path(), "one")?;
 		fs::remove_file(repo.path().join(".git/config")).map_err(|err| format!("rm .git/config: {err:?}"))?;

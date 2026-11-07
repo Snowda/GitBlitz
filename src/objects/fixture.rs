@@ -9,6 +9,7 @@ use miniz_oxide::deflate::compress_to_vec_zlib;
 
 use super::loose;
 use super::oid::{Oid, OID_LEN};
+use crate::testrepo::TestResult;
 
 pub const BLOB: u8 = 3;
 // A u64 varint takes at most ten bytes; a header is two of them, or one and a base id.
@@ -27,7 +28,7 @@ pub fn zlib(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Writes a loose blob of `body` under `objects`.
-pub fn put_loose(objects: &Path, raw: [u8; OID_LEN], body: &[u8]) -> Result<(), String> {
+pub fn put_loose(objects: &Path, raw: [u8; OID_LEN], body: &[u8]) -> TestResult {
 	let path: PathBuf = loose::path(objects, &Oid::from_raw(raw));
 	fs::create_dir_all(path.parent().ok_or("no parent")?).map_err(|e| format!("mkdir: {e}"))?;
 	let mut stream: Vec<u8> = format!("blob {}\0", body.len()).into_bytes();
@@ -158,7 +159,7 @@ impl PackBuilder {
 	}
 
 	/// Writes `<pack_dir>/<name>.pack` and `.idx`, and gives the index path.
-	pub fn write(&self, pack_dir: &Path, name: &str) -> Result<PathBuf, String> {
+	pub fn write(&self, pack_dir: &Path, name: &str) -> TestResult<PathBuf> {
 		fs::create_dir_all(pack_dir).map_err(|e| format!("mkdir {}: {e}", pack_dir.display()))?;
 		let idx: PathBuf = pack_dir.join(format!("{name}.idx"));
 		fs::write(idx.with_extension("pack"), self.pack_bytes()).map_err(|e| format!("write pack: {e}"))?;

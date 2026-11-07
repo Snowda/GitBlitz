@@ -161,6 +161,7 @@ mod tests {
 	use super::{be32, Idx, MAGIC, OID_BYTES, TABLES, TRAILER, WINDOW, WINDOW_LEN};
 	use crate::error::MissReason;
 	use crate::objects::oid::{Oid, OID_LEN};
+	use crate::testrepo::TestResult;
 
 	// A version 2 index of `ids` (sorted) at `offsets`; a 64-bit offset goes in the large table.
 	fn index_bytes(ids: &[[u8; OID_LEN]], offsets: &[u64]) -> Vec<u8> {
@@ -195,7 +196,7 @@ mod tests {
 	}
 
 	#[test]
-	fn finds_small_and_large_offsets_and_reports_absent_ids() -> Result<(), String> {
+	fn finds_small_and_large_offsets_and_reports_absent_ids() -> TestResult {
 		let mut ids: [[u8; OID_LEN]; 200] = [[0; OID_LEN]; 200];
 		ids.iter_mut().zip(0_u8..).for_each(|(id, i)| *id = [i / 2, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 		let mut offsets: [u64; 200] = [0; 200];
@@ -212,7 +213,7 @@ mod tests {
 
 	// A bucket bigger than the read window is narrowed by a binary search first.
 	#[test]
-	fn a_large_bucket_is_searched() -> Result<(), String> {
+	fn a_large_bucket_is_searched() -> TestResult {
 		assert_eq!(u64::try_from(WINDOW_LEN).ok(), Some(WINDOW * OID_BYTES), "the stack window must hold WINDOW ids");
 		let mut ids: [[u8; OID_LEN]; 256] = [[0; OID_LEN]; 256];
 		ids.iter_mut().zip(0..=255_u8).for_each(|(id, i)| *id = [3, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -251,7 +252,7 @@ mod tests {
 
 	// A 64-bit offset slot that points past its table is malformed, not a read of the trailer.
 	#[test]
-	fn a_large_offset_slot_past_the_table_is_malformed() -> Result<(), String> {
+	fn a_large_offset_slot_past_the_table_is_malformed() -> TestResult {
 		let id: [u8; OID_LEN] = [5; OID_LEN];
 		let mut bytes: Vec<u8> = index_bytes(&[id], &[12]);
 		let slot_at: usize = usize::try_from(TABLES).unwrap_or(0) + OID_LEN + 4;

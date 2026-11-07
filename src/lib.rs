@@ -17,12 +17,14 @@ mod file_list;
 mod index;
 #[cfg(test)]
 mod isolating_config;
+mod lines;
 #[cfg(feature = "list")]
 mod listing;
 mod object_format;
 mod objects;
 mod refs;
 mod small_file;
+mod span;
 #[cfg(test)]
 mod testrepo;
 
@@ -30,11 +32,11 @@ use std::path::{Path, PathBuf};
 
 pub use discover::read_git_dir;
 pub use env::GitEnv;
-pub use error::{Cause, Error, Miss, MissReason};
+pub use error::{Cause, Error, Miss, MissReason, Unparsed, EXCERPT_MAX};
 pub use git_objects::{objects, tree_entries};
 pub use objects::{
-	read_object, read_object_header, read_objects, read_tree_entries, read_tree_entry, Header, Object, ObjectKind, Oid,
-	OidError, TreeEntry,
+	read_object, read_object_header, read_objects, read_tree_entries, read_tree_entry, Header, Object, ObjectKind, ObjectRef,
+	Objects, Oid, OidError, TreeEntries, TreeEntry,
 };
 pub use refs::{read_head, OidHex, OID_HEX_MAX};
 #[cfg(feature = "list")]
@@ -111,20 +113,20 @@ mod tests {
 
 	use super::{git_dir, head, oid_hex, read_git_dir, read_head, unless_redirected, Cause, Error, GitEnv, Miss, MissReason, OidHex};
 	use crate::small_file::SMALL_FILE_MAX;
-	use crate::testrepo::{commit, expect_err, git, git_fails, is_oid, new_repo, ok, rev, same_dir};
+	use crate::testrepo::{commit, expect_err, git, git_fails, is_oid, new_repo, ok, rev, same_dir, TestResult};
 
-	fn utf8(path: &Path) -> Result<&str, String> {
+	fn utf8(path: &Path) -> TestResult<&str> {
 		return path.to_str().ok_or_else(|| format!("{} is not UTF-8", path.display()));
 	}
 
 	// A repo with one commit on `main`.
-	fn committed_repo() -> Result<TempDir, String> {
+	fn committed_repo() -> TestResult<TempDir> {
 		let repo: TempDir = new_repo()?;
 		commit(repo.path(), "one")?;
 		return Ok(repo);
 	}
 
-	fn assert_git_dir_matches(dir: &Path) -> Result<(), String> {
+	fn assert_git_dir_matches(dir: &Path) -> TestResult {
 		let fast: PathBuf = ok(read_git_dir(dir), "fast path should answer")?;
 		let truth: String = git(dir, &["rev-parse", "--absolute-git-dir"])?;
 		assert!(same_dir(&fast, Path::new(&truth))?, "{} vs git {truth}", fast.display());
@@ -133,7 +135,7 @@ mod tests {
 		return Ok(());
 	}
 
-	fn assert_head_matches(dir: &Path) -> Result<OidHex, String> {
+	fn assert_head_matches(dir: &Path) -> TestResult<OidHex> {
 		let fast: OidHex = ok(read_head(dir), "fast path should answer")?;
 		assert_eq!(fast.as_str(), git(dir, &["rev-parse", "HEAD"])?);
 		assert_eq!(ok(head(dir, GitEnv::NONE), "head(dir)")?, fast);
@@ -142,7 +144,7 @@ mod tests {
 	}
 
 	// The reader misses for `reason`, and `head` still answers what git prints.
-	fn assert_head_falls_back(dir: &Path, reason: MissReason) -> Result<Miss, String> {
+	fn assert_head_falls_back(dir: &Path, reason: MissReason) -> TestResult<Miss> {
 		let miss: Miss = expect_err(read_head(dir), "read_head")?;
 		assert_eq!(miss.reason, reason);
 		let slow: OidHex = ok(head(dir, GitEnv::NONE), "head")?;
@@ -152,7 +154,7 @@ mod tests {
 
 	// git's answer converts whole up to a SHA-256 oid's length; longer output is refused, not truncated.
 	#[test]
-	fn oid_hex_keeps_up_to_64_digits_and_refuses_more() -> Result<(), String> {
+	fn oid_hex_keeps_up_to_64_digits_and_refuses_more() -> TestResult {
 		let longest: String = "ab".repeat(32);
 		let whole: OidHex = ok(oid_hex(&longest), "oid_hex(64 digits)")?;
 		assert_eq!(whole.as_str(), longest);
@@ -162,7 +164,7 @@ mod tests {
 	}
 
 	#[test]
-	fn normal_repo_answers_from_files() -> Result<(), String> {
+	fn normal_repo_answers_from_files() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		assert_git_dir_matches(repo.path())?;
 		assert_head_matches(repo.path())?;
@@ -170,7 +172,7 @@ mod tests {
 	}
 
 	#[test]
-	fn subdirectory_climbs_to_the_repo() -> Result<(), String> {
+	fn subdirectory_climbs_to_the_repo() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let sub: PathBuf = repo.path().join("a").join("b");
 		ok(fs::create_dir_all(&sub), "create a/b")?;
@@ -181,7 +183,7 @@ mod tests {
 
 	// The config selects SHA-256, so the reader takes the 64-hex ref itself; a packed ref reads the same.
 	#[test]
-	fn sha256_repo_head_is_what_git_prints() -> Result<(), String> {
+	fn sha256_repo_head_is_what_git_prints() -> TestResult {
 		let repo: TempDir = ok(tempdir(), "tempdir()")?;
 		git(repo.path(), &["init", "-q", "-b", "main", "--object-format=sha256"])?;
 		commit(repo.path(), "one")?;
@@ -197,7 +199,7 @@ mod tests {
 
 	// An object format the reader does not know is git's to judge, so the reader misses at the config.
 	#[test]
-	fn an_unknown_object_format_misses_at_the_config() -> Result<(), String> {
+	fn an_unknown_object_format_misses_at_the_config() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let config: PathBuf = repo.path().join(".git/config");
 		let mut file = ok(OpenOptions::new().append(true).open(&config), "open config")?;
@@ -209,7 +211,7 @@ mod tests {
 	}
 
 	#[test]
-	fn head_tracks_a_new_commit() -> Result<(), String> {
+	fn head_tracks_a_new_commit() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let before: OidHex = assert_head_matches(repo.path())?;
 		commit(repo.path(), "two")?;
@@ -220,7 +222,7 @@ mod tests {
 	}
 
 	#[test]
-	fn linked_worktree_resolves_its_own_git_dir_and_branch() -> Result<(), String> {
+	fn linked_worktree_resolves_its_own_git_dir_and_branch() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let wt: PathBuf = repo.path().join("wt");
 		git(repo.path(), &["worktree", "add", "-b", "side", utf8(&wt)?])?;
@@ -236,7 +238,7 @@ mod tests {
 	}
 
 	#[test]
-	fn packed_branch_is_read_from_packed_refs() -> Result<(), String> {
+	fn packed_branch_is_read_from_packed_refs() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		git(repo.path(), &["pack-refs", "--all"])?;
 		assert!(!repo.path().join(".git/refs/heads/main").exists());
@@ -245,7 +247,7 @@ mod tests {
 	}
 
 	#[test]
-	fn detached_head_is_read_directly() -> Result<(), String> {
+	fn detached_head_is_read_directly() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let first: OidHex = rev(repo.path(), "HEAD")?;
 		commit(repo.path(), "two")?;
@@ -257,7 +259,7 @@ mod tests {
 	}
 
 	#[test]
-	fn unborn_branch_falls_back_and_fails_like_git() -> Result<(), String> {
+	fn unborn_branch_falls_back_and_fails_like_git() -> TestResult {
 		let repo: TempDir = new_repo()?;
 		assert_git_dir_matches(repo.path())?;
 		assert_eq!(expect_err(read_head(repo.path()), "read_head")?.reason, MissReason::Unborn);
@@ -270,7 +272,7 @@ mod tests {
 	}
 
 	#[test]
-	fn branch_pointing_at_a_ref_falls_back() -> Result<(), String> {
+	fn branch_pointing_at_a_ref_falls_back() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		git(repo.path(), &["symbolic-ref", "refs/heads/alias", "refs/heads/main"])?;
 		git(repo.path(), &["symbolic-ref", "HEAD", "refs/heads/alias"])?;
@@ -280,7 +282,7 @@ mod tests {
 
 	// Without `extensions.refStorage` git keeps the files backend, so a stray `reftable/` changes neither answer.
 	#[test]
-	fn a_stray_reftable_dir_is_ignored_like_git_does() -> Result<(), String> {
+	fn a_stray_reftable_dir_is_ignored_like_git_does() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let before: OidHex = assert_head_matches(repo.path())?;
 		ok(fs::create_dir(repo.path().join(".git/reftable")), "create .git/reftable")?;
@@ -290,7 +292,7 @@ mod tests {
 
 	// read_head reads HEAD to check it. When HEAD is absent or is a directory, the miss is still `NoHead`.
 	#[test]
-	fn read_head_reports_a_missing_or_directory_head_as_no_head() -> Result<(), String> {
+	fn read_head_reports_a_missing_or_directory_head_as_no_head() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let head: PathBuf = repo.path().join(".git/HEAD");
 		ok(fs::remove_file(&head), "remove HEAD")?;
@@ -301,7 +303,7 @@ mod tests {
 	}
 
 	#[test]
-	fn ref_storage_config_falls_back() -> Result<(), String> {
+	fn ref_storage_config_falls_back() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let config: PathBuf = repo.path().join(".git/config");
 		let text: String = ok(fs::read_to_string(&config), "read config")?;
@@ -311,7 +313,7 @@ mod tests {
 	}
 
 	#[test]
-	fn malformed_loose_ref_falls_back_to_git() -> Result<(), String> {
+	fn malformed_loose_ref_falls_back_to_git() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let loose: PathBuf = repo.path().join(".git/refs/heads/main");
 		let oid: String = ok(fs::read_to_string(&loose), "read loose ref")?;
@@ -324,7 +326,7 @@ mod tests {
 
 	// git accepts whitespace after a loose ref's oid; past the reader's buffer it misses, and git still answers.
 	#[test]
-	fn a_loose_ref_longer_than_the_read_buffer_falls_back_to_git() -> Result<(), String> {
+	fn a_loose_ref_longer_than_the_read_buffer_falls_back_to_git() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let loose: PathBuf = repo.path().join(".git/refs/heads/main");
 		let oid: String = ok(fs::read_to_string(&loose), "read loose ref")?;
@@ -336,7 +338,7 @@ mod tests {
 	}
 
 	#[test]
-	fn relative_gitfile_resolves_against_its_folder() -> Result<(), String> {
+	fn relative_gitfile_resolves_against_its_folder() -> TestResult {
 		let root: TempDir = new_repo()?;
 		let work: PathBuf = root.path().join("work");
 		let store: PathBuf = root.path().join("store");
@@ -351,7 +353,7 @@ mod tests {
 	}
 
 	#[test]
-	fn bare_repo_nested_in_a_work_tree_defers_to_git() -> Result<(), String> {
+	fn bare_repo_nested_in_a_work_tree_defers_to_git() -> TestResult {
 		let repo: TempDir = new_repo()?;
 		let bare: PathBuf = repo.path().join("inner.git");
 		git(repo.path(), &["init", "-q", "--bare", utf8(&bare)?])?;
@@ -363,7 +365,7 @@ mod tests {
 
 	// With no `.git` or `HEAD` in any ancestor both refuse, and the error relays git's own words.
 	#[test]
-	fn outside_any_repo_the_reader_and_git_both_refuse() -> Result<(), String> {
+	fn outside_any_repo_the_reader_and_git_both_refuse() -> TestResult {
 		let dir: TempDir = ok(tempdir(), "tempdir()")?;
 		let git_stderr: String = git_fails(dir.path(), &["rev-parse", "--absolute-git-dir"])?;
 		assert!(git_stderr.contains("not a git repository"), "{git_stderr}");
@@ -376,7 +378,7 @@ mod tests {
 	}
 
 	#[test]
-	fn missing_dir_reports_the_dir() -> Result<(), String> {
+	fn missing_dir_reports_the_dir() -> TestResult {
 		let repo: TempDir = new_repo()?;
 		let err: Error = expect_err(git_dir(&repo.path().join("missing"), GitEnv::NONE), "git_dir")?;
 		assert!(matches!(err.cause, Cause::Spawn(_)), "{err}");
@@ -386,7 +388,7 @@ mod tests {
 
 	// A caller's GIT_DIR skips the file reader and reaches git, so both answers move to the other repo.
 	#[test]
-	fn a_callers_git_dir_moves_the_answer_to_that_repo() -> Result<(), String> {
+	fn a_callers_git_dir_moves_the_answer_to_that_repo() -> TestResult {
 		let here: TempDir = committed_repo()?;
 		let there: TempDir = committed_repo()?;
 		commit(there.path(), "two")?;
@@ -424,7 +426,7 @@ mod tests {
 
 	// A redirect to a git dir that does not exist skips the reader, and `head` relays git's own refusal.
 	#[test]
-	fn head_under_a_missing_git_dir_relays_gits_failure() -> Result<(), String> {
+	fn head_under_a_missing_git_dir_relays_gits_failure() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let gone: PathBuf = repo.path().join("no-such.git");
 		let bad: [(&str, &OsStr); 1] = [("GIT_DIR", gone.as_os_str())];
@@ -438,7 +440,7 @@ mod tests {
 	// `list_files` passes git's failure through its `?` and does not return an empty list.
 	#[cfg(feature = "list")]
 	#[test]
-	fn list_files_under_a_missing_git_dir_relays_gits_failure() -> Result<(), String> {
+	fn list_files_under_a_missing_git_dir_relays_gits_failure() -> TestResult {
 		let repo: TempDir = committed_repo()?;
 		let gone: PathBuf = repo.path().join("no-such.git");
 		let bad: [(&str, &OsStr); 1] = [("GIT_DIR", gone.as_os_str())];
@@ -451,7 +453,7 @@ mod tests {
 
 	// A helper that cannot start git returns why, so the calling test fails with that text instead of a panic.
 	#[test]
-	fn git_in_a_missing_dir_returns_the_spawn_error() -> Result<(), String> {
+	fn git_in_a_missing_dir_returns_the_spawn_error() -> TestResult {
 		let repo = new_repo()?;
 		let gone: PathBuf = repo.path().join("gone");
 		let ran = git(&gone, &["status"]);
@@ -463,7 +465,7 @@ mod tests {
 
 	// git echoes a config value byte for byte, so a non-UTF-8 value is an Err, not a lossy string.
 	#[test]
-	fn git_with_non_utf8_stdout_returns_an_err() -> Result<(), String> {
+	fn git_with_non_utf8_stdout_returns_an_err() -> TestResult {
 		let repo = new_repo()?;
 		let mut config = ok(OpenOptions::new().append(true).open(repo.path().join(".git/config")), "open config")?;
 		ok(config.write_all(b"[probe]\n\tvalue = caf\xe9\n"), "append config")?;
@@ -474,7 +476,7 @@ mod tests {
 	}
 
 	#[test]
-	fn same_dir_sees_through_dot_dot_and_errs_on_a_missing_side() -> Result<(), String> {
+	fn same_dir_sees_through_dot_dot_and_errs_on_a_missing_side() -> TestResult {
 		let repo = new_repo()?;
 		let root: &Path = repo.path();
 		assert!(same_dir(&root.join(".git").join(".."), root)?);

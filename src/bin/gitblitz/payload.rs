@@ -59,9 +59,10 @@ mod tests {
 	use serde_json::{json, Value};
 
 	use super::{is_pointer, read, text, truth, WrongType};
+	use crate::TestResult;
 
 	#[test]
-	fn empty_or_bom_only_stdin_is_null_and_a_bom_before_json_is_dropped() -> Result<(), String> {
+	fn empty_or_bom_only_stdin_is_null_and_a_bom_before_json_is_dropped() -> TestResult {
 		let read_str = |input: &str| return read(&mut input.as_bytes()).map_err(|err| format!("read {input:?}: {err:?}"));
 		assert_eq!(read_str("")?, Value::Null);
 		assert_eq!(read_str("\u{feff} \n")?, Value::Null);

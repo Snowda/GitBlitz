@@ -24,6 +24,10 @@ const USAGE: &str = "usage: gitblitz <git-dir|head> [DIR] \
 	| gitblitz gate --flag NAME [--require-file F]... [--skip-if PTR] [IN] -- <cmd> [args...] \
 	(IN: --dir D | --dir-from PTR; PTR: a JSON pointer into the stdin payload, such as /cwd)";
 
+/// A test's outcome: the error is the message the failed assertion prints.
+#[cfg(test)]
+type TestResult<T = ()> = Result<T, String>;
+
 /// A hook command's option name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Key {
@@ -352,33 +356,52 @@ fn main() -> ExitCode {
 mod tests {
 	use std::ffi::{OsStr, OsString};
 	use std::fs;
-	use std::io::{self, Read};
+	use std::io::{self, Cursor, Read};
 	use std::path::{Path, PathBuf};
 	use std::process::{Command, Output};
 
+	use arrayvec::{ArrayString, ArrayVec};
 	use tempfile::TempDir;
 
 	use super::hook::Flag;
-	use super::{parse, run, Cli, Exit, HookAction, Key, Query, Source, Values, USAGE};
+	use super::{emit, parse, run, Cli, Exit, HookAction, Key, Query, Source, TestResult, Values, USAGE};
 
 	// One caller's schema (Claude Code's hook payload); nothing outside these args knows it.
 	const NAME: &str = "test-edit-flag";
 	const MARK: [&str; 12] =
 		["hook", "mark", "--flag", NAME, "--suffix", ".rs", "--suffix", ".toml", "--dir-from", "/cwd", "--path-from", "/tool_input/file_path"];
 	const CLEAR: [&str; 6] = ["hook", "clear", "--flag", NAME, "--dir-from", "/cwd"];
+	// The most words one test call passes; a longer call is an error, not a reallocation.
+	const MAX_ARGS: usize = 16;
+
+	// The most bytes one test call prints to a stream; more fails the write, so the call exits with failure.
+	const CAPTURE_MAX: usize = 4096;
+
+	type Words<'a> = ArrayVec<&'a str, MAX_ARGS>;
+	type Argv = ArrayVec<OsString, MAX_ARGS>;
+	type Capture = Cursor<[u8; CAPTURE_MAX]>;
+	type Text = ArrayString<CAPTURE_MAX>;
 
 	// `gate` args that run `cmd` for `NAME` in a crate root.
-	fn gate_args<'a>(cmd: &[&'a str]) -> Vec<&'a str> {
+	fn gate_args<'a>(cmd: &[&'a str]) -> TestResult<Words<'a>> {
 		let options: [&str; 10] =
 			["gate", "--flag", NAME, "--require-file", "Cargo.toml", "--dir-from", "/cwd", "--skip-if", "/stop_hook_active", "--"];
-		return options.into_iter().chain(cmd.iter().copied()).collect();
+		let mut words: Words<'a> = ArrayVec::new();
+		words.try_extend_from_slice(&options).and_then(|()| return words.try_extend_from_slice(cmd)).map_err(|err| format!("{cmd:?}: {err}"))?;
+		return Ok(words);
 	}
 
-	fn utf8(path: &Path) -> Result<&str, String> {
+	fn os_args(words: &[&str]) -> TestResult<Argv> {
+		let mut args: Argv = ArrayVec::new();
+		words.iter().try_for_each(|word: &&str| return args.try_push(OsString::from(word))).map_err(|err| format!("{words:?}: {err}"))?;
+		return Ok(args);
+	}
+
+	fn utf8(path: &Path) -> TestResult<&str> {
 		return path.to_str().ok_or_else(|| return format!("{} is not UTF-8", path.display()));
 	}
 
-	fn git_init() -> Result<TempDir, String> {
+	fn git_init() -> TestResult<TempDir> {
 		let dir: TempDir = match tempfile::tempdir() {
 			Ok(value) => value,
 			Err(err) => return Err(format!("tempfile::tempdir(): {err:?}")),
@@ -399,31 +422,33 @@ mod tests {
 		return Ok(dir);
 	}
 
-	fn call_with(args: &[&str], stdin: &str) -> Result<(Exit, String, String), String> {
-		let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-		let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+	fn capture() -> Capture {
+		return Cursor::new([0; CAPTURE_MAX]);
+	}
+
+	// The bytes written so far.
+	fn captured(sink: &Capture) -> &[u8] {
+		return sink.get_ref().get(..usize::try_from(sink.position()).unwrap_or(CAPTURE_MAX)).unwrap_or_default();
+	}
+
+	fn text(sink: &Capture, what: &str) -> TestResult<Text> {
+		let printed: &str = str::from_utf8(captured(sink)).map_err(|err| format!("{what} is not UTF-8: {err:?}"))?;
+		return Text::from(printed).map_err(|err| format!("{what}: {err}"));
+	}
+
+	fn call_with(args: &[&str], stdin: &str) -> TestResult<(Exit, Text, Text)> {
+		let args: Argv = os_args(args)?;
+		let (mut out, mut err): (Capture, Capture) = (capture(), capture());
 		let code: Exit = run(&args, &mut stdin.as_bytes(), &mut out, &mut err);
-		let got_from_utf8 = match String::from_utf8(out) {
-			Ok(value) => value,
-			Err(err) => return Err(format!("String::from_utf8(out): {err:?}")),
-		};
-		let got_from_utf8_2 = match String::from_utf8(err) {
-			Ok(value) => value,
-			Err(err) => return Err(format!("String::from_utf8(err): {err:?}")),
-		};
-		return Ok((
-			code,
-			got_from_utf8,
-			got_from_utf8_2,
-		));
+		return Ok((code, text(&out, "stdout")?, text(&err, "stderr")?));
 	}
 
 	// A call's exit code, stdout and stderr, borrowed so an assert compares them with literals.
-	fn shown(got: &(Exit, String, String)) -> (Exit, &str, &str) {
+	fn shown(got: &(Exit, Text, Text)) -> (Exit, &str, &str) {
 		return (got.0, &got.1, &got.2);
 	}
 
-	fn call(args: &[&str]) -> Result<(Exit, String, String), String> {
+	fn call(args: &[&str]) -> TestResult<(Exit, Text, Text)> {
 		let got_call_with = match call_with(args, "") {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call_with: {err}")),
@@ -438,7 +463,7 @@ mod tests {
 	}
 
 	#[test]
-	fn git_dir_prints_the_repos_git_dir() -> Result<(), String> {
+	fn git_dir_prints_the_repos_git_dir() -> TestResult {
 		let repo: TempDir = match git_init() {
 			Ok(value) => value,
 			Err(err) => return Err(format!("git_init: {err}")),
@@ -468,7 +493,7 @@ mod tests {
 	}
 
 	#[test]
-	fn unborn_head_fails_with_gits_reason() -> Result<(), String> {
+	fn unborn_head_fails_with_gits_reason() -> TestResult {
 		let repo: TempDir = match git_init() {
 			Ok(value) => value,
 			Err(err) => return Err(format!("git_init: {err}")),
@@ -485,7 +510,7 @@ mod tests {
 
 	// The printed line is git's own answer byte for byte: the oid, then one newline.
 	#[test]
-	fn head_prints_what_git_rev_parse_prints() -> Result<(), String> {
+	fn head_prints_what_git_rev_parse_prints() -> TestResult {
 		let repo: TempDir = match git_init() {
 			Ok(value) => value,
 			Err(err) => return Err(format!("git_init: {err}")),
@@ -507,13 +532,13 @@ mod tests {
 			Err(err) => return Err(format!("call: {err}")),
 		};
 		assert_eq!((code, err.as_str()), (Exit::Success, ""));
-		assert_eq!(out, str::from_utf8(&truth.stdout).map_err(|e| e.to_string())?.replace("\r\n", "\n"));
+		assert_eq!(out.as_str(), str::from_utf8(&truth.stdout).map_err(|e| e.to_string())?.replace("\r\n", "\n"));
 		assert_eq!(out.len(), 41, "{out:?}");
 		return Ok(());
 	}
 
 	#[test]
-	fn bad_usage_prints_usage() -> Result<(), String> {
+	fn bad_usage_prints_usage() -> TestResult {
 		let cases: [&[&str]; 33] = [
 			&[],
 			&["nope"],
@@ -550,7 +575,7 @@ mod tests {
 			&["gate", "--flag", "a", "--dir-from", "/cwd", "--dir", "d", "--", "x"],
 		];
 		let usage: &str = &format!("{USAGE}\n");
-		return cases.iter().try_for_each(|args: &&[&str]| -> Result<(), String> {
+		return cases.iter().try_for_each(|args: &&[&str]| -> TestResult {
 			let got = match call(args) {
 				Ok(value) => value,
 				Err(err) => return Err(format!("call {args:?}: {err}")),
@@ -569,36 +594,46 @@ mod tests {
 		}
 	}
 
+	// A capture too small for the line fails the write, so a test sees a failed call, never a cut one.
 	#[test]
-	fn bad_usage_is_reported_before_stdin_is_read() {
+	fn a_full_capture_fails_the_call() {
+		let mut small: Cursor<[u8; 4]> = Cursor::new([0; 4]);
+		assert_eq!(emit(&mut small, "longer than four", Exit::Success), Exit::Failure);
+		let mut sink: Capture = capture();
+		assert_eq!(emit(&mut sink, "fits", Exit::Success), Exit::Success);
+		assert_eq!(captured(&sink), b"fits\n");
+	}
+
+	#[test]
+	fn bad_usage_is_reported_before_stdin_is_read() -> TestResult {
 		let cases: [&[&str]; 6] =
 			[&["hook", "nope"], &["hook", "mark", "extra"], &["hook", "mark"], &["hook"], &["gate"], &["gate", "--flag", "a", "--"]];
-		cases.iter().for_each(|args: &&[&str]| {
-			let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-			let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
-			let code: Exit = run(&args, &mut Unreadable, &mut out, &mut err);
-			assert_eq!((code, str::from_utf8(&err)), (Exit::Usage, Ok(format!("{USAGE}\n").as_str())), "{args:?}");
+		return cases.iter().try_for_each(|args: &&[&str]| -> TestResult {
+			let argv: Argv = os_args(args)?;
+			let (mut out, mut err): (Capture, Capture) = (capture(), capture());
+			let code: Exit = run(&argv, &mut Unreadable, &mut out, &mut err);
+			assert_eq!((code, str::from_utf8(captured(&err))), (Exit::Usage, Ok(format!("{USAGE}\n").as_str())), "{args:?}");
+			return Ok(());
 		});
 	}
 
 	#[test]
-	fn parse_maps_each_form_to_its_command() -> Result<(), String> {
-		let args = |words: &[&str]| -> Vec<OsString> { return words.iter().map(OsString::from).collect() };
-		let (head, gate): (Vec<OsString>, Vec<OsString>) = (args(&["head", "d"]), args(&gate_args(&["git", "x", "y"])));
+	fn parse_maps_each_form_to_its_command() -> TestResult {
+		let (head, gate): (Argv, Argv) = (os_args(&["head", "d"])?, os_args(&gate_args(&["git", "x", "y"])?)?);
 		let flag: Flag<'_> = Flag::new(OsStr::new(NAME)).ok_or("NAME is a valid flag")?;
 		let cwd: Source<'_> = Source::Field("/cwd");
-		assert_eq!(parse(&args(&["git-dir"])), Some(Cli::Query(Query::GitDir, None)));
+		assert_eq!(parse(&os_args(&["git-dir"])?), Some(Cli::Query(Query::GitDir, None)));
 		assert_eq!(parse(&head), Some(Cli::Query(Query::Head, Some(Path::new("d")))));
 		let pair = |key: &str, value: &str| -> [OsString; 2] { return [OsString::from(key), OsString::from(value)] };
 		let (suffix_pairs, required_pairs) = ([pair("--suffix", ".rs"), pair("--suffix", ".toml")], [pair("--require-file", "Cargo.toml")]);
 		let suffixes: Values<'_> = Values { pairs: &suffix_pairs, key: Key::Suffix };
 		let (no_suffixes, no_required) = (Values { pairs: &[], key: Key::Suffix }, Values { pairs: &[], key: Key::RequireFile });
 		let marked = HookAction::Mark { flag, suffixes, path: Source::Field("/tool_input/file_path") };
-		assert_eq!(parse(&args(&MARK)), Some(Cli::Hook(cwd, marked)));
-		let plain: Vec<OsString> = args(&["hook", "mark", "--path", "a.rs", "--flag", NAME, "--dir", "d"]);
+		assert_eq!(parse(&os_args(&MARK)?), Some(Cli::Hook(cwd, marked)));
+		let plain: Argv = os_args(&["hook", "mark", "--path", "a.rs", "--flag", NAME, "--dir", "d"])?;
 		let plain_mark = HookAction::Mark { flag, suffixes: no_suffixes, path: Source::Arg(OsStr::new("a.rs")) };
 		assert_eq!(parse(&plain), Some(Cli::Hook(Source::Arg(OsStr::new("d")), plain_mark)));
-		assert_eq!(parse(&args(&CLEAR)), Some(Cli::Hook(cwd, HookAction::Clear { flag })));
+		assert_eq!(parse(&os_args(&CLEAR)?), Some(Cli::Hook(cwd, HookAction::Clear { flag })));
 		let gated = HookAction::Gate {
 			flag,
 			required: Values { pairs: &required_pairs, key: Key::RequireFile },
@@ -607,14 +642,14 @@ mod tests {
 			args: &gate[11..],
 		};
 		assert_eq!(parse(&gate), Some(Cli::Hook(cwd, gated)));
-		let bare: Vec<OsString> = args(&["gate", "--flag", NAME, "--", "git"]);
+		let bare: Argv = os_args(&["gate", "--flag", NAME, "--", "git"])?;
 		let ungated = HookAction::Gate { flag, required: no_required, skip_if: None, program: OsStr::new("git"), args: &[] };
 		assert_eq!(parse(&bare), Some(Cli::Hook(Source::Unset, ungated)));
 		return Ok(());
 	}
 
 	#[test]
-	fn no_dir_means_the_cwd() -> Result<(), String> {
+	fn no_dir_means_the_cwd() -> TestResult {
 		let (code, out, _) = match call(&["git-dir"]) {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call: {err}")),
@@ -625,17 +660,17 @@ mod tests {
 	}
 
 	#[test]
-	fn mark_then_gate_runs_the_command_and_clear_skips_it() -> Result<(), String> {
+	fn mark_then_gate_runs_the_command_and_clear_skips_it() -> TestResult {
 		let repo: TempDir = git_init()?;
 		fs::write(repo.path().join("Cargo.toml"), "").map_err(|err| format!("write Cargo.toml: {err:?}"))?;
 		let edit: String = payload(repo.path(), r#","tool_input":{"file_path":"src/x.rs"}"#);
 		let stop: String = payload(repo.path(), "");
-		let failing_gate: Vec<&str> = gate_args(&["git", "rev-parse", "--verify", "no-such-ref"]);
+		let failing_gate: Words<'_> = gate_args(&["git", "rev-parse", "--verify", "no-such-ref"])?;
 		assert_eq!(call_with(&failing_gate, &stop)?.0, Exit::Success, "skipped before any edit");
 		assert_eq!(shown(&call_with(&MARK, &edit)?), (Exit::Success, "", ""));
 		assert!(repo.path().join(".git").join(NAME).is_file());
 		assert_eq!(call_with(&failing_gate, &stop)?.0, Exit::Gated(128), "ran and passed git's exit code through");
-		assert_eq!(call_with(&gate_args(&["git", "--version"]), &stop)?.0, Exit::Gated(0), "ran, not skipped");
+		assert_eq!(call_with(&gate_args(&["git", "--version"])?, &stop)?.0, Exit::Gated(0), "ran, not skipped");
 		assert_eq!(call_with(&CLEAR, &stop)?.0, Exit::Success);
 		assert!(!repo.path().join(".git").join(NAME).exists());
 		assert_eq!(call_with(&failing_gate, &stop)?.0, Exit::Success, "skipped again after clear");
@@ -644,7 +679,7 @@ mod tests {
 
 	// The CLI writes the name it is given and no other: a second name gates on its own marker.
 	#[test]
-	fn the_callers_flag_name_is_the_marker_file() -> Result<(), String> {
+	fn the_callers_flag_name_is_the_marker_file() -> TestResult {
 		let repo: TempDir = git_init()?;
 		fs::write(repo.path().join("Cargo.toml"), "").map_err(|err| format!("write Cargo.toml: {err:?}"))?;
 		let (edit, stop): (String, String) = (payload(repo.path(), r#","tool_input":{"file_path":"a.rs"}"#), payload(repo.path(), ""));
@@ -657,12 +692,12 @@ mod tests {
 			.collect();
 		assert_eq!(names, [OsString::from(NAME)]);
 		assert_eq!(call_with(&other_gate, &stop)?.0, Exit::Success, "other-flag was never marked, so it skips");
-		assert_eq!(call_with(&gate_args(&["git", "--version"]), &stop)?.0, Exit::Gated(0));
+		assert_eq!(call_with(&gate_args(&["git", "--version"])?, &stop)?.0, Exit::Gated(0));
 		return Ok(());
 	}
 
 	#[test]
-	fn a_missing_gate_binary_skips_quietly() -> Result<(), String> {
+	fn a_missing_gate_binary_skips_quietly() -> TestResult {
 		let repo: TempDir = match git_init() {
 			Ok(value) => value,
 			Err(err) => return Err(format!("git_init: {err}")),
@@ -680,7 +715,7 @@ mod tests {
 			}
 		};
 		let stop: String = payload(repo.path(), "");
-		let got_call_with_8 = match call_with(&gate_args(&["no-such-gate-binary-xyz"]), &stop) {
+		let got_call_with_8 = match call_with(&gate_args(&["no-such-gate-binary-xyz"])?, &stop) {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call_with: {err}")),
 		};
@@ -689,7 +724,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_bom_prefixed_payload_still_marks() -> Result<(), String> {
+	fn a_bom_prefixed_payload_still_marks() -> TestResult {
 		let repo: TempDir = match git_init() {
 			Ok(value) => value,
 			Err(err) => return Err(format!("git_init: {err}")),
@@ -705,7 +740,7 @@ mod tests {
 	}
 
 	#[test]
-	fn bad_payload_fails_noisily() -> Result<(), String> {
+	fn bad_payload_fails_noisily() -> TestResult {
 		let (code, _, err) = match call_with(&MARK, "{not json") {
 			Ok(value) => value,
 			Err(err) => return Err(format!("call_with: {err}")),
@@ -717,33 +752,33 @@ mod tests {
 
 	// No `--*-from` option: stdin is never read, so ordinary code calls the hooks with plain arguments.
 	#[test]
-	fn plain_arguments_never_read_stdin() -> Result<(), String> {
+	fn plain_arguments_never_read_stdin() -> TestResult {
 		let repo: TempDir = git_init()?;
 		let dir: &str = utf8(repo.path())?;
 		// Each call must leave stderr empty; the exit code is what the asserts compare.
-		let call_unreadable = |words: &[&str]| -> Exit {
-			let args: Vec<OsString> = words.iter().map(OsString::from).collect();
-			let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+		let call_unreadable = |words: &[&str]| -> TestResult<Exit> {
+			let args: Argv = os_args(words)?;
+			let (mut out, mut err): (Capture, Capture) = (capture(), capture());
 			let code: Exit = run(&args, &mut Unreadable, &mut out, &mut err);
-			assert!(err.is_empty(), "{words:?}: {}", err.escape_ascii());
-			return code;
+			assert!(captured(&err).is_empty(), "{words:?}: {}", captured(&err).escape_ascii());
+			return Ok(code);
 		};
-		let mark: [&str; 9] = ["hook", "mark", "--flag", NAME, "--suffix", ".rs", "--dir", dir, "--path"];
-		assert_eq!(call_unreadable(&[&mark[..], &["README.md"]].concat()), Exit::Success);
+		let mark = |path: &'static str| -> [&str; 10] { return ["hook", "mark", "--flag", NAME, "--suffix", ".rs", "--dir", dir, "--path", path] };
+		assert_eq!(call_unreadable(&mark("README.md"))?, Exit::Success);
 		assert!(!repo.path().join(".git").join(NAME).exists(), "README.md has no listed suffix");
-		assert_eq!(call_unreadable(&[&mark[..], &["src/a.rs"]].concat()), Exit::Success);
+		assert_eq!(call_unreadable(&mark("src/a.rs"))?, Exit::Success);
 		assert!(repo.path().join(".git").join(NAME).is_file());
 		let gate: [&str; 8] = ["gate", "--flag", NAME, "--dir", dir, "--", "git", "--version"];
-		assert_eq!(call_unreadable(&gate), Exit::Gated(0));
-		assert_eq!(call_unreadable(&["hook", "clear", "--flag", NAME, "--dir", dir]), Exit::Success);
+		assert_eq!(call_unreadable(&gate)?, Exit::Gated(0));
+		assert_eq!(call_unreadable(&["hook", "clear", "--flag", NAME, "--dir", dir])?, Exit::Success);
 		assert!(!repo.path().join(".git").join(NAME).exists());
-		assert_eq!(call_unreadable(&gate), Exit::Success, "skipped after clear");
+		assert_eq!(call_unreadable(&gate)?, Exit::Success, "skipped after clear");
 		return Ok(());
 	}
 
 	// A payload with another shape works through the caller's own pointers; gitblitz knows no field names.
 	#[test]
-	fn another_payload_schema_works_through_its_own_pointers() -> Result<(), String> {
+	fn another_payload_schema_works_through_its_own_pointers() -> TestResult {
 		let repo: TempDir = git_init()?;
 		let root: String = utf8(repo.path())?.replace('\\', "/");
 		let edit: String = format!(r#"{{"workspace":{{"root":"{root}"}},"change":{{"file":"lib.rs"}}}}"#);
@@ -763,12 +798,12 @@ mod tests {
 	}
 
 	#[test]
-	fn the_skip_field_skips_before_anything_else() -> Result<(), String> {
+	fn the_skip_field_skips_before_anything_else() -> TestResult {
 		let repo: TempDir = git_init()?;
 		fs::write(repo.path().join("Cargo.toml"), "").map_err(|err| format!("write Cargo.toml: {err:?}"))?;
 		let edit: String = payload(repo.path(), r#","tool_input":{"file_path":"a.rs"}"#);
 		assert_eq!(call_with(&MARK, &edit)?.0, Exit::Success);
-		let failing_gate: Vec<&str> = gate_args(&["git", "rev-parse", "--verify", "no-such-ref"]);
+		let failing_gate: Words<'_> = gate_args(&["git", "rev-parse", "--verify", "no-such-ref"])?;
 		assert_eq!(call_with(&failing_gate, &payload(repo.path(), r#","stop_hook_active":true"#))?.0, Exit::Success);
 		assert_eq!(call_with(&failing_gate, &payload(repo.path(), r#","stop_hook_active":false"#))?.0, Exit::Gated(128));
 		return Ok(());
@@ -776,14 +811,14 @@ mod tests {
 
 	// A field of the wrong type is an error, never a silent default.
 	#[test]
-	fn a_payload_field_of_the_wrong_type_fails_noisily() -> Result<(), String> {
-		let version_gate: Vec<&str> = gate_args(&["git", "--version"]);
+	fn a_payload_field_of_the_wrong_type_fails_noisily() -> TestResult {
+		let version_gate: Words<'_> = gate_args(&["git", "--version"])?;
 		let cases: [(&[&str], &str, &str); 3] = [
 			(&MARK, r#"{"cwd":5}"#, "gitblitz: payload field /cwd is not a string"),
 			(&MARK, r#"{"tool_input":{"file_path":["a.rs"]}}"#, "gitblitz: payload field /tool_input/file_path is not a string"),
 			(&version_gate, r#"{"stop_hook_active":"yes"}"#, "gitblitz: payload field /stop_hook_active is not a bool"),
 		];
-		return cases.iter().try_for_each(|(args, stdin, want): &(&[&str], &str, &str)| -> Result<(), String> {
+		return cases.iter().try_for_each(|(args, stdin, want): &(&[&str], &str, &str)| -> TestResult {
 			let (code, _, err) = call_with(args, stdin)?;
 			assert_eq!((code, err.trim_end()), (Exit::Failure, *want), "{stdin}");
 			return Ok(());

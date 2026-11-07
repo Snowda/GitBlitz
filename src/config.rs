@@ -3,11 +3,12 @@
 //! Only `[core]` and `[extensions]` keys count. A quoted or continued value, an unclosed section header, or a
 //! boolean git refuses gives `Malformed`, and the caller then asks git.
 
-use std::fs;
-use std::io::ErrorKind;
+use std::io::{Error as IoError, ErrorKind};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use crate::error::{Miss, MissReason};
+use crate::lines::scan_lines;
 use crate::object_format::ObjectFormat;
 
 pub const CONFIG_FILE: &str = "config";
@@ -29,11 +30,41 @@ impl Default for RepoConfig {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Section {
 	Core,
 	Extensions,
+	#[default]
 	Other,
+}
+
+/// The settings so far and the section the next line is in, fed one line at a time.
+#[derive(Default)]
+struct Parser {
+	config: RepoConfig,
+	section: Section,
+}
+
+impl Parser {
+	fn line(&mut self, raw: &[u8]) -> Result<(), MissReason> {
+		// No key spans lines, so a mention in some line is a mention in the file.
+		self.config.ref_storage |= mentions(raw, "refstorage");
+		let line = String::from_utf8_lossy(raw);
+		let mut rest: &str = line.trim();
+		if let Some(header) = rest.strip_prefix('[') {
+			let (name, after) = header.split_once(']').ok_or(MissReason::Malformed)?;
+			self.section = Section::parse(name);
+			rest = after.trim();
+		}
+		if rest.is_empty() || rest.starts_with(['#', ';']) {
+			return Ok(());
+		}
+		// A value continued onto the next line could hide or fake any key there.
+		if rest.bytes().rev().take_while(|b: &u8| return *b == b'\\').count() % 2 == 1 {
+			return Err(MissReason::Malformed);
+		}
+		return self.config.set(self.section, rest);
+	}
 }
 
 impl Section {
@@ -52,8 +83,12 @@ impl Section {
 /// # Errors
 /// A [`Miss`] at `path` when it does not read or does not parse.
 pub fn read(path: &Path) -> Result<Option<RepoConfig>, Miss> {
-	return match fs::read(path) {
-		Ok(bytes) => RepoConfig::parse(&bytes).map(Some).map_err(|reason: MissReason| return Miss::new(path, reason)),
+	let mut parser: Parser = Parser::default();
+	let scanned: Result<Option<MissReason>, IoError> =
+		scan_lines(path, |raw: &[u8]| return parser.line(raw).map_or_else(ControlFlow::Break, ControlFlow::Continue));
+	return match scanned {
+		Ok(None) => Ok(Some(parser.config)),
+		Ok(Some(reason)) => Err(Miss::new(path, reason)),
 		Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
 		Err(err) => Err(Miss::io(path, &err)),
 	};
@@ -64,27 +99,11 @@ impl RepoConfig {
 	///
 	/// # Errors
 	/// `Malformed` for a line this parser does not settle, `ObjectFormat` for an object format it does not know.
+	#[cfg(test)]
 	pub fn parse(bytes: &[u8]) -> Result<Self, MissReason> {
-		let mut config: Self = Self { ref_storage: mentions(bytes, "refstorage"), ..Self::default() };
-		let mut section: Section = Section::Other;
-		for raw in bytes.split(|b: &u8| return *b == b'\n') {
-			let line = String::from_utf8_lossy(raw);
-			let mut rest: &str = line.trim();
-			if let Some(header) = rest.strip_prefix('[') {
-				let (name, after) = header.split_once(']').ok_or(MissReason::Malformed)?;
-				section = Section::parse(name);
-				rest = after.trim();
-			}
-			if rest.is_empty() || rest.starts_with(['#', ';']) {
-				continue;
-			}
-			// A value continued onto the next line could hide or fake any key there.
-			if rest.bytes().rev().take_while(|b: &u8| return *b == b'\\').count() % 2 == 1 {
-				return Err(MissReason::Malformed);
-			}
-			config.set(section, rest)?;
-		}
-		return Ok(config);
+		let mut parser: Parser = Parser::default();
+		bytes.split(|b: &u8| return *b == b'\n').try_for_each(|raw: &[u8]| return parser.line(raw))?;
+		return Ok(parser.config);
 	}
 
 	fn set(&mut self, section: Section, line: &str) -> Result<(), MissReason> {

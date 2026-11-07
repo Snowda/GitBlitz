@@ -14,7 +14,10 @@ use crate::isolating_config::ISOLATING_CONFIG;
 use crate::object_format::ObjectFormat;
 use crate::refs::OidHex;
 
-fn run(dir: &Path, args: &[&str]) -> Result<Output, String> {
+/// A test's outcome: the error is the message the failed assertion prints.
+pub type TestResult<T = ()> = Result<T, String>;
+
+fn run(dir: &Path, args: &[&str]) -> TestResult<Output> {
 	let got_new = match Command::new("git")
 		.args(ISOLATING_CONFIG)
 		.args(args)
@@ -34,7 +37,7 @@ fn run(dir: &Path, args: &[&str]) -> Result<Output, String> {
 }
 
 /// Runs git in `dir`, asserts success, and returns trimmed stdout.
-pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
 	let out: Output = match run(dir, args) {
 		Ok(value) => value,
 		Err(err) => return Err(format!("run: {err}")),
@@ -49,13 +52,13 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Runs `git rev-parse <name>` in `dir` and keeps the printed id on the stack.
-pub fn rev(dir: &Path, name: &str) -> Result<OidHex, String> {
+pub fn rev(dir: &Path, name: &str) -> TestResult<OidHex> {
 	let printed: String = git(dir, &["rev-parse", name])?;
 	return OidHex::from(&printed).map_err(|e| format!("rev-parse {name}: {e}"));
 }
 
 /// Runs git in `dir`, asserts failure, and returns trimmed stderr.
-pub fn git_fails(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub fn git_fails(dir: &Path, args: &[&str]) -> TestResult<String> {
 	let out: Output = match run(dir, args) {
 		Ok(value) => value,
 		Err(err) => return Err(format!("run: {err}")),
@@ -70,7 +73,7 @@ pub fn git_fails(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Runs git in `dir` with `input` on stdin, asserts success, and returns stdout byte for byte.
-pub fn git_bytes(dir: &Path, args: &[&str], input: &[u8]) -> Result<Vec<u8>, String> {
+pub fn git_bytes(dir: &Path, args: &[&str], input: &[u8]) -> TestResult<Vec<u8>> {
 	let mut child = Command::new("git")
 		.args(ISOLATING_CONFIG)
 		.args(args)
@@ -90,7 +93,7 @@ pub fn git_bytes(dir: &Path, args: &[&str], input: &[u8]) -> Result<Vec<u8>, Str
 	return Ok(out.stdout);
 }
 
-pub fn new_repo() -> Result<TempDir, String> {
+pub fn new_repo() -> TestResult<TempDir> {
 	let dir: TempDir = match tempfile::tempdir() {
 		Ok(value) => value,
 		Err(err) => return Err(format!("tempfile::tempdir(): {err:?}")),
@@ -102,7 +105,7 @@ pub fn new_repo() -> Result<TempDir, String> {
 	return Ok(dir);
 }
 
-pub fn commit(dir: &Path, message: &str) -> Result<(), String> {
+pub fn commit(dir: &Path, message: &str) -> TestResult {
 	match git(dir, &["commit", "-q", "--allow-empty", "--no-verify", "-m", message]) {
 		Ok(_) => {}
 		Err(err) => return Err(format!("git: {err}")),
@@ -111,7 +114,7 @@ pub fn commit(dir: &Path, message: &str) -> Result<(), String> {
 }
 
 /// Same directory on disk, ignoring separator style, `..` and 8.3 short names.
-pub fn same_dir(a: &Path, b: &Path) -> Result<bool, String> {
+pub fn same_dir(a: &Path, b: &Path) -> TestResult<bool> {
 	let got_canonicalize = match fs::canonicalize(a) {
 		Ok(value) => value,
 		Err(err) => return Err(format!("fs::canonicalize(a): {err:?}")),
@@ -123,7 +126,7 @@ pub fn same_dir(a: &Path, b: &Path) -> Result<bool, String> {
 	return Ok(got_canonicalize == got_canonicalize_2);
 }
 
-pub fn expect_err<T: Debug, E>(result: Result<T, E>, what: &str) -> Result<E, String> {
+pub fn expect_err<T: Debug, E>(result: Result<T, E>, what: &str) -> TestResult<E> {
 	return match result {
 		Ok(value) => Err(format!("{what}: expected Err, got Ok({value:?})")),
 		Err(err) => Ok(err),
@@ -131,7 +134,7 @@ pub fn expect_err<T: Debug, E>(result: Result<T, E>, what: &str) -> Result<E, St
 }
 
 /// `result`'s value, or its error as text that names the step `what`.
-pub fn ok<T, E: Display>(result: Result<T, E>, what: &str) -> Result<T, String> {
+pub fn ok<T, E: Display>(result: Result<T, E>, what: &str) -> TestResult<T> {
 	return match result {
 		Ok(value) => Ok(value),
 		Err(err) => Err(format!("{what}: {err}")),

@@ -149,7 +149,7 @@ mod tests {
 	use super::is_drive_relative;
 	use crate::error::{Miss, MissReason};
 	use crate::small_file::SMALL_FILE_MAX;
-	use crate::testrepo::{expect_err, new_repo, same_dir};
+	use crate::testrepo::{expect_err, new_repo, same_dir, TestResult};
 
 	#[test]
 	fn without_dots_folds_parent_and_current_components() {
@@ -158,7 +158,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_file_as_dir_is_not_a_directory() -> Result<(), String> {
+	fn a_file_as_dir_is_not_a_directory() -> TestResult {
 		let repo = new_repo()?;
 		let file: PathBuf = repo.path().join("plain.txt");
 		fs::write(&file, "x").map_err(|err| format!("fs::write(&file, \"x\"): {err:?}"))?;
@@ -168,7 +168,7 @@ mod tests {
 	}
 
 	#[test]
-	fn missing_dir_is_a_not_found_miss() -> Result<(), String> {
+	fn missing_dir_is_a_not_found_miss() -> TestResult {
 		let repo = new_repo()?;
 		let miss = expect_err(read_git_dir(&repo.path().join("missing")), "read_git_dir(missing)")?;
 		assert!(matches!(miss.reason, MissReason::Io(_)), "{miss}");
@@ -177,7 +177,7 @@ mod tests {
 	}
 
 	#[test]
-	fn gitfile_without_prefix_is_bad() -> Result<(), String> {
+	fn gitfile_without_prefix_is_bad() -> TestResult {
 		let repo = new_repo()?;
 		let work: PathBuf = repo.path().join("work");
 		fs::create_dir(&work).map_err(|err| format!("fs::create_dir(&work): {err:?}"))?;
@@ -189,7 +189,7 @@ mod tests {
 	}
 
 	#[test]
-	fn gitfile_to_a_dir_without_head_is_refused() -> Result<(), String> {
+	fn gitfile_to_a_dir_without_head_is_refused() -> TestResult {
 		let repo = new_repo()?;
 		let work: PathBuf = repo.path().join("work");
 		fs::create_dir_all(work.join("empty")).map_err(|err| format!("mkdir work/empty: {err:?}"))?;
@@ -200,7 +200,7 @@ mod tests {
 	}
 
 	#[test]
-	fn dot_git_dir_without_head_is_refused() -> Result<(), String> {
+	fn dot_git_dir_without_head_is_refused() -> TestResult {
 		let repo = new_repo()?;
 		let work: PathBuf = repo.path().join("work");
 		fs::create_dir_all(work.join(".git")).map_err(|err| format!("mkdir work/.git: {err:?}"))?;
@@ -210,7 +210,7 @@ mod tests {
 	}
 
 	#[test]
-	fn inside_dot_git_defers_to_git() -> Result<(), String> {
+	fn inside_dot_git_defers_to_git() -> TestResult {
 		let repo = new_repo()?;
 		let miss = expect_err(read_git_dir(&repo.path().join(".git").join("refs")), "read_git_dir(.git/refs)")?;
 		assert_eq!(miss.reason, MissReason::BareCandidate);
@@ -220,7 +220,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_head_that_is_a_directory_is_no_head() -> Result<(), String> {
+	fn a_head_that_is_a_directory_is_no_head() -> TestResult {
 		let repo = new_repo()?;
 		let work: PathBuf = repo.path().join("work");
 		fs::create_dir_all(work.join(".git").join("HEAD")).map_err(|err| format!("mkdir work/.git/HEAD: {err:?}"))?;
@@ -232,7 +232,7 @@ mod tests {
 
 	// A gitfile's `..` resolves lexically when no symlink is on the way, and the answer is the real git dir.
 	#[test]
-	fn gitfile_with_parent_steps_resolves_to_the_target_git_dir() -> Result<(), String> {
+	fn gitfile_with_parent_steps_resolves_to_the_target_git_dir() -> TestResult {
 		let repo = new_repo()?;
 		let work: PathBuf = repo.path().join("nest").join("work");
 		fs::create_dir_all(&work).map_err(|err| format!("mkdir nest/work: {err:?}"))?;

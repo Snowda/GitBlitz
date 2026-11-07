@@ -176,6 +176,7 @@ mod tests {
 	use crate::objects::idx::Idx;
 	use crate::objects::kind::ObjectKind;
 	use crate::objects::oid::{Oid, OID_LEN};
+	use crate::testrepo::TestResult;
 
 	fn one_blob_pack() -> PackBuilder {
 		let mut pack: PackBuilder = PackBuilder::default();
@@ -184,7 +185,7 @@ mod tests {
 	}
 
 	// Opens a pack written as `pack` beside the index `builder` makes; the reason it is refused, if any.
-	fn open_reason(builder: &PackBuilder, pack: Option<&[u8]>) -> Result<Option<MissReason>, String> {
+	fn open_reason(builder: &PackBuilder, pack: Option<&[u8]>) -> TestResult<Option<MissReason>> {
 		let dir: TempDir = tempdir().map_err(|e| e.to_string())?;
 		let idx_path: PathBuf = builder.write(dir.path(), "pack-x")?;
 		match pack {
@@ -196,7 +197,7 @@ mod tests {
 	}
 
 	#[test]
-	fn open_checks_the_header_count_and_checksum_against_the_index() -> Result<(), String> {
+	fn open_checks_the_header_count_and_checksum_against_the_index() -> TestResult {
 		let builder: PackBuilder = one_blob_pack();
 		let good: Vec<u8> = builder.pack_bytes();
 		assert_eq!(open_reason(&builder, Some(&good))?, None);
@@ -216,7 +217,7 @@ mod tests {
 	}
 
 	#[test]
-	fn entry_reads_inside_the_entries_and_refuses_the_rest() -> Result<(), String> {
+	fn entry_reads_inside_the_entries_and_refuses_the_rest() -> TestResult {
 		let mut builder: PackBuilder = one_blob_pack();
 		let bad_type: u64 = builder.entry([0x0b; OID_LEN], &[0x00], b"");
 		let lie: u64 = builder.entry([0x0c; OID_LEN], &entry_head(BLOB, 1 << 40), b"tiny");

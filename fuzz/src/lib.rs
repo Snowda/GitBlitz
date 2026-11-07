@@ -15,6 +15,9 @@ use gitblitz::{
 };
 use tempfile::TempDir;
 
+/// A harness step's outcome: the error is the message the failed assertion prints.
+type TestResult<T = ()> = Result<T, String>;
+
 const DOT_GIT: &str = ".git";
 const HEAD_FILE: &str = "HEAD";
 const INDEX_FILE: &str = "index";
@@ -99,7 +102,7 @@ pub fn index_roundtrip(data: &[u8]) {
 	let mut expected: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
 	expected.sort();
 	expected.dedup();
-	assert!(listed.as_ref().is_ok_and(|files| *files == expected), "v{version} index of {names:?} read back as {listed:?}");
+	assert!(listed.as_ref().is_ok_and(|files| *files == *expected), "v{version} index of {names:?} read back as {listed:?}");
 }
 
 /// HEAD resolves to lowercase hex (40 digits, or 64 under a SHA-256 config) from the file git reads, or not at all.
@@ -195,12 +198,12 @@ pub fn check_pack(data: &[u8]) -> bool {
 
 // A scratch work tree whose `.git` holds `files`. A write that fails is a harness fault, so it asserts.
 fn scratch_repo(files: &[(&str, &[u8])]) -> Option<TempDir> {
-	let made: Result<TempDir, String> = write_repo(files);
+	let made: TestResult<TempDir> = write_repo(files);
 	assert!(made.is_ok(), "scratch repo: {:?}", made.as_ref().err());
 	return made.ok();
 }
 
-fn write_repo(files: &[(&str, &[u8])]) -> Result<TempDir, String> {
+fn write_repo(files: &[(&str, &[u8])]) -> TestResult<TempDir> {
 	let repo: TempDir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
 	let git_dir: PathBuf = repo.path().join(DOT_GIT);
 	for (rel, bytes) in files {

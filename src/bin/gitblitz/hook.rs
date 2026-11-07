@@ -88,13 +88,14 @@ mod tests {
 	use tempfile::TempDir;
 
 	use super::{clear, gate, mark, Flag, Verdict};
+	use crate::TestResult;
 
 	const NAME: &str = "test-edit-flag";
 	const SUFFIXES: [&str; 2] = [".rs", ".toml"];
 	const CRATE: [&str; 1] = ["Cargo.toml"];
 	const NONE: [&str; 0] = [];
 
-	fn flag() -> Result<Flag<'static>, String> {
+	fn flag() -> TestResult<Flag<'static>> {
 		return Flag::new(OsStr::new(NAME)).ok_or_else(|| return format!("Flag::new({NAME:?}) is None"));
 	}
 
@@ -106,7 +107,7 @@ mod tests {
 		return Some(OsStr::new(path));
 	}
 
-	fn git(dir: &Path, args: &[&str]) -> Result<(), String> {
+	fn git(dir: &Path, args: &[&str]) -> TestResult {
 		let out: Output = match Command::new("git")
 			.args(["-c", "user.name=gitblitz", "-c", "user.email=gitblitz@test.invalid", "-c", "commit.gpgsign=false"])
 			.args(args)
@@ -117,7 +118,7 @@ mod tests {
 	}
 
 	// A crate repo with one commit plus a linked worktree `wt` that also holds a Cargo.toml.
-	fn crate_with_worktree() -> Result<(TempDir, PathBuf), String> {
+	fn crate_with_worktree() -> TestResult<(TempDir, PathBuf)> {
 		let tmp: TempDir = tempfile::tempdir().map_err(|err| format!("tempfile::tempdir(): {err:?}"))?;
 		let main: PathBuf = tmp.path().join("main");
 		fs::create_dir(&main).map_err(|err| format!("fs::create_dir(&main): {err:?}"))?;
@@ -132,7 +133,7 @@ mod tests {
 	}
 
 	#[test]
-	fn worktree_marker_round_trip_opens_and_closes_the_gate() -> Result<(), String> {
+	fn worktree_marker_round_trip_opens_and_closes_the_gate() -> TestResult {
 		let (_tmp, wt) = crate_with_worktree()?;
 		let (flag, files) = (flag()?, crate_files());
 		assert!(fs::write(wt.join(".git").join(NAME), "").is_err(), "the old .git/ marker path cannot exist here");
@@ -148,7 +149,7 @@ mod tests {
 	}
 
 	#[test]
-	fn only_edits_with_a_listed_suffix_mark() -> Result<(), String> {
+	fn only_edits_with_a_listed_suffix_mark() -> TestResult {
 		let (_tmp, wt) = crate_with_worktree()?;
 		let (flag, files) = (flag()?, crate_files());
 		let mark_one = |edited: Option<&OsStr>| return mark(&wt, edited, flag, SUFFIXES).map_err(|err| format!("mark: {err:?}"));
@@ -161,7 +162,7 @@ mod tests {
 	}
 
 	#[test]
-	fn no_suffixes_means_every_call_marks() -> Result<(), String> {
+	fn no_suffixes_means_every_call_marks() -> TestResult {
 		let (_tmp, wt) = crate_with_worktree()?;
 		let got: Option<PathBuf> = mark(&wt, None, flag()?, NONE).map_err(|err| format!("mark: {err:?}"))?;
 		assert!(got.is_some_and(|path: PathBuf| return path.is_file()));
@@ -170,7 +171,7 @@ mod tests {
 
 	// The caller's name is the whole contract: two names are two independent markers.
 	#[test]
-	fn each_flag_name_is_its_own_marker() -> Result<(), String> {
+	fn each_flag_name_is_its_own_marker() -> TestResult {
 		let (_tmp, wt) = crate_with_worktree()?;
 		let other: Flag<'_> = Flag::new(OsStr::new("other-flag")).ok_or("other-flag is valid")?;
 		let (flag, files) = (flag()?, crate_files());
@@ -184,7 +185,7 @@ mod tests {
 	}
 
 	#[test]
-	fn gate_skips_dirs_missing_a_required_file() -> Result<(), String> {
+	fn gate_skips_dirs_missing_a_required_file() -> TestResult {
 		let (_tmp, wt) = crate_with_worktree()?;
 		let (flag, files) = (flag()?, crate_files());
 		mark(&wt, edit("a.rs"), flag, SUFFIXES).map_err(|err| format!("mark: {err:?}"))?;
@@ -208,7 +209,7 @@ mod tests {
 	}
 
 	#[test]
-	fn outside_a_repo_nothing_is_marked_or_cleared() -> Result<(), String> {
+	fn outside_a_repo_nothing_is_marked_or_cleared() -> TestResult {
 		let tmp: TempDir = tempfile::tempdir().map_err(|err| format!("tempfile::tempdir(): {err:?}"))?;
 		let flag: Flag<'_> = flag()?;
 		assert_eq!(mark(tmp.path(), edit("a.rs"), flag, SUFFIXES).map_err(|err| format!("mark: {err:?}"))?, None);

@@ -41,9 +41,10 @@ mod tests {
 	use tempfile::{tempdir, TempDir};
 
 	use super::{read_small, SmallBuf, SMALL_FILE_MAX};
+	use crate::testrepo::TestResult;
 
 	// The text borrows `buf`, which outlives the scratch file.
-	fn kind_or_text<'b>(bytes: &[u8], buf: &'b mut SmallBuf) -> Result<Result<&'b str, ErrorKind>, String> {
+	fn kind_or_text<'b>(bytes: &[u8], buf: &'b mut SmallBuf) -> TestResult<Result<&'b str, ErrorKind>> {
 		let dir: TempDir = tempdir().map_err(|err| format!("tempdir(): {err:?}"))?;
 		let path = dir.path().join("f");
 		fs::write(&path, bytes).map_err(|err| format!("write: {err:?}"))?;
@@ -51,7 +52,7 @@ mod tests {
 	}
 
 	#[test]
-	fn reads_up_to_the_buffer_and_refuses_a_file_that_fills_it() -> Result<(), String> {
+	fn reads_up_to_the_buffer_and_refuses_a_file_that_fills_it() -> TestResult {
 		let longest: String = "a".repeat(SMALL_FILE_MAX - 1);
 		let mut buf: SmallBuf = [0; SMALL_FILE_MAX];
 		assert_eq!(kind_or_text(format!("{longest}b").as_bytes(), &mut buf)?, Err(ErrorKind::FileTooLarge));
@@ -62,7 +63,7 @@ mod tests {
 	}
 
 	#[test]
-	fn non_utf8_is_invalid_data_and_a_missing_file_is_not_found() -> Result<(), String> {
+	fn non_utf8_is_invalid_data_and_a_missing_file_is_not_found() -> TestResult {
 		assert_eq!(kind_or_text(b"caf\xe9", &mut [0; SMALL_FILE_MAX])?, Err(ErrorKind::InvalidData));
 		let dir: TempDir = tempdir().map_err(|err| format!("tempdir(): {err:?}"))?;
 		let mut buf: SmallBuf = [0; SMALL_FILE_MAX];
@@ -72,7 +73,7 @@ mod tests {
 
 	// The open fails on Windows and the read on Unix; either way a directory is an error, never empty text.
 	#[test]
-	fn a_directory_is_an_error_not_empty_text() -> Result<(), String> {
+	fn a_directory_is_an_error_not_empty_text() -> TestResult {
 		let dir: TempDir = tempdir().map_err(|err| format!("tempdir(): {err:?}"))?;
 		let mut buf: SmallBuf = [0; SMALL_FILE_MAX];
 		let got = read_small(dir.path(), &mut buf).map_err(|err| err.kind());

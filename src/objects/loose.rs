@@ -8,8 +8,8 @@ use arrayvec::ArrayString;
 
 use super::kind::ObjectKind;
 use super::oid::{Oid, OID_HEX_LEN};
-use super::zlib::{inflate, inflate_exact, Fill, InflateError, Input};
-use super::{Header, Object};
+use super::zlib::{inflate, inflate_exact_append, Fill, InflateError, Input};
+use super::Header;
 use crate::error::{Miss, MissReason};
 
 // "commit " plus 20 digits of a u64 plus the NUL fit with room to spare.
@@ -56,12 +56,20 @@ impl Loose {
 	}
 
 	/// The whole object, inflated again from the start; `Malformed` unless it holds exactly the declared size.
-	pub fn read(&self) -> Result<Object, Miss> {
+	#[cfg(test)]
+	pub fn read(&self) -> Result<super::Object, Miss> {
+		let mut body: Vec<u8> = Vec::new();
+		self.read_append(&mut body)?;
+		return Ok(super::Object { kind: self.header.kind, size: self.header.size, body: Some(body) });
+	}
+
+	/// The body onto the end of `out`, with the errors of [`Self::read`]; on an error, `out` keeps what it held.
+	pub fn read_append(&self, out: &mut Vec<u8>) -> Result<(), Miss> {
 		let size: usize = usize::try_from(self.header.size).map_err(|_| return Miss::new(&self.path, MissReason::Malformed))?;
-		let mut all: Vec<u8> = inflate_exact(&mut input(&self.file, &self.path)?, self.header_len + size)
-			.map_err(|err| return miss(&self.path, err))?;
-		all.drain(..self.header_len);
-		return Ok(Object { kind: self.header.kind, size: self.header.size, body: Some(all) });
+		let start: usize = out.len();
+		inflate_exact_append(&mut input(&self.file, &self.path)?, self.header_len + size, out).map_err(|err| return miss(&self.path, err))?;
+		out.drain(start..start + self.header_len);
+		return Ok(());
 	}
 }
 
@@ -104,12 +112,12 @@ mod tests {
 	use crate::objects::kind::ObjectKind;
 	use crate::objects::oid::{Oid, OidError, OID_LEN};
 	use crate::objects::{Header, Object};
-	use crate::testrepo::{ok, Lossy};
+	use crate::testrepo::{ok, Lossy, TestResult};
 
 	const OID: Oid = Oid::from_raw([0x5e; OID_LEN]);
 
 	// Writes `stream` as the loose file of [`OID`] under a fresh objects directory.
-	fn with_loose(stream: &[u8]) -> Result<(TempDir, PathBuf), String> {
+	fn with_loose(stream: &[u8]) -> TestResult<(TempDir, PathBuf)> {
 		let dir: TempDir = ok(tempdir(), "tempdir")?;
 		let file: PathBuf = path(dir.path(), &OID);
 		ok(fs::create_dir_all(file.parent().ok_or("no parent")?), "mkdir")?;
@@ -118,18 +126,18 @@ mod tests {
 		return Ok((dir, objects));
 	}
 
-	fn open_some(objects: &Path) -> Result<Loose, String> {
+	fn open_some(objects: &Path) -> TestResult<Loose> {
 		return Ok(ok(Loose::open(objects, &OID), "open")?.ok_or("no loose object")?);
 	}
 
-	fn open_reason(stream: &[u8]) -> Result<Option<MissReason>, String> {
+	fn open_reason(stream: &[u8]) -> TestResult<Option<MissReason>> {
 		let (_dir, objects) = with_loose(stream)?;
 		return Ok(Loose::open(&objects, &OID).err().map(|m| m.reason));
 	}
 
 	// A body longer than the header buffer fills it, so the header parses from a full prefix too.
 	#[test]
-	fn short_and_long_objects_open_and_read_back_whole() -> Result<(), String> {
+	fn short_and_long_objects_open_and_read_back_whole() -> TestResult {
 		let mut long: [u8; HEADER_MAX * 3] = [0; HEADER_MAX * 3];
 		long.iter_mut().zip((0..=255_u8).cycle()).for_each(|(slot, byte)| *slot = byte);
 		for body in [b"hello".as_slice(), b"".as_slice(), long.as_slice()] {
@@ -146,14 +154,14 @@ mod tests {
 	}
 
 	#[test]
-	fn an_absent_object_is_none() -> Result<(), String> {
+	fn an_absent_object_is_none() -> TestResult {
 		let dir: TempDir = ok(tempdir(), "tempdir")?;
 		assert!(ok(Loose::open(dir.path(), &OID), "open")?.is_none());
 		return Ok(());
 	}
 
 	#[test]
-	fn garbage_a_bad_header_or_a_size_the_file_cannot_hold_is_malformed() -> Result<(), String> {
+	fn garbage_a_bad_header_or_a_size_the_file_cannot_hold_is_malformed() -> TestResult {
 		let malformed: Option<MissReason> = Some(MissReason::Malformed);
 		assert_eq!(open_reason(b"not zlib at all")?, malformed, "garbage");
 		assert_eq!(open_reason(&zlib(b"blob x\0"))?, malformed, "a header git refuses");
@@ -162,7 +170,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_body_shorter_than_its_header_says_opens_but_does_not_read() -> Result<(), String> {
+	fn a_body_shorter_than_its_header_says_opens_but_does_not_read() -> TestResult {
 		let (_dir, objects) = with_loose(&zlib(b"blob 20\0short"))?;
 		let miss = open_some(&objects)?.read().err().ok_or("read should miss")?;
 		assert_eq!((miss.reason, miss.path), (MissReason::Malformed, path(&objects, &OID)));
@@ -171,7 +179,7 @@ mod tests {
 
 	// Windows refuses to open a directory; elsewhere the open works and the first read fails.
 	#[test]
-	fn a_directory_at_the_object_path_is_an_io_miss() -> Result<(), String> {
+	fn a_directory_at_the_object_path_is_an_io_miss() -> TestResult {
 		let dir: TempDir = ok(tempdir(), "tempdir")?;
 		ok(fs::create_dir_all(path(dir.path(), &OID)), "mkdir")?;
 		let reason: Option<MissReason> = Loose::open(dir.path(), &OID).err().map(|m| m.reason);
