@@ -4,21 +4,36 @@ use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::thread;
 
 use crate::env::GitEnv;
-use crate::error::{Cause, Error, Miss};
+use crate::error::{Cause, Error, Miss, Unparsed};
+
+/// A `git <args>` run that failed, before the caller attaches the file reader's [`Miss`].
+pub struct Failed {
+	pub args: &'static [&'static str],
+	pub cause: Cause,
+}
+
+impl Failed {
+	pub fn unparsed(args: &'static [&'static str], text: Unparsed) -> Self {
+		return Self { args, cause: Cause::Unparsed(Box::new(text)) };
+	}
+
+	pub fn with(self, dir: &Path, miss: Miss) -> Error {
+		return Error { dir: dir.to_path_buf(), args: self.args, miss, cause: self.cause };
+	}
+}
 
 /// Runs `git <args> <extra>` in `dir` for an object command, with `input` copied to stdin, and returns stdout whole.
 ///
 /// # Errors
-/// [`Error`] when git cannot start, fails, or its stdin cannot be written.
+/// [`Failed`] when git cannot start, fails, or its stdin cannot be written.
 pub fn run_objects<'e>(
 	dir: &Path,
 	args: &'static [&'static str],
 	extra: impl IntoIterator<Item = &'e str>,
 	mut input: impl Read + Send,
 	env: GitEnv<'_>,
-	miss: Miss,
-) -> Result<Vec<u8>, Error> {
-	let fail = |cause: Cause| -> Error { return Error { dir: dir.to_path_buf(), args, miss, cause } };
+) -> Result<Vec<u8>, Failed> {
+	let fail = |cause: Cause| -> Failed { return Failed { args, cause } };
 	let mut command: Command = Command::new("git");
 	env.apply_for_objects(&mut command).args(args).args(extra).current_dir(dir);
 	command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());

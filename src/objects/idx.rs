@@ -232,18 +232,20 @@ mod tests {
 
 	#[test]
 	fn version_one_a_falling_fanout_and_a_short_file_are_refused() -> IoResult<()> {
-		let good: Vec<u8> = index_bytes(&[[1; OID_LEN]], &[12]);
+		let mut good: Vec<u8> = index_bytes(&[[1; OID_LEN]], &[12]);
 		let reason = |bytes: &[u8]| -> IoResult<Option<MissReason>> {
 			let (_dir, path) = write(bytes)?;
 			return Ok(Idx::open(&path).err().map(|m| m.reason));
 		};
 		assert_eq!(reason(&good)?, None);
-		let mut v1: Vec<u8> = good.clone();
-		v1[0] = 0;
-		assert_eq!(reason(&v1)?, Some(MissReason::UnsupportedPack));
-		let mut falling: Vec<u8> = good.clone();
-		falling[usize::try_from(TABLES).unwrap_or(0) - 1] = 0;
-		assert_eq!(reason(&falling)?, Some(MissReason::Malformed));
+		let falling_at: usize = usize::try_from(TABLES).unwrap_or(0) - 1;
+		[(0, MissReason::UnsupportedPack), (falling_at, MissReason::Malformed)].into_iter().try_for_each(|(at, want)| -> IoResult<()> {
+			let was: u8 = std::mem::replace(&mut good[at], 0);
+			assert_eq!(reason(&good)?, Some(want));
+			good[at] = was;
+			return Ok(());
+		})?;
+		assert_eq!(reason(&good)?, None, "each change is undone");
 		assert_eq!(reason(good.get(..good.len() - 1).unwrap_or_default())?, Some(MissReason::Malformed));
 		assert_eq!(reason(&good[..usize::try_from(TABLES + TRAILER).unwrap_or(0) - 1])?, Some(MissReason::Malformed));
 		assert_eq!(be32(&[0, 0, 1], 0), None);

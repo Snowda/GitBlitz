@@ -2,6 +2,7 @@
 //! `-- loop [secs]` instead spins the file reader on this repo for a sampling profiler (FlareBlitz).
 
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write};
@@ -10,6 +11,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arrayvec::{ArrayString, ArrayVec};
 use gitblitz::{GitEnv, Oid};
 use tempfile::TempDir;
 
@@ -30,11 +32,17 @@ const OBJECT_ITERS: usize = 200;
 const OBJECT_GIT_ITERS: usize = 20;
 const OBJECT_FILES: usize = 20;
 const OBJECT_COMMITS: usize = 30;
+// `ls-tree -l <head> --` before the paths.
+const LS_TREE_ARGS: usize = 4;
+const CASES: usize = 6;
 // A blob cap like parley's: every fixture blob fits under it.
 const OBJECT_CAP: u64 = 1 << 20;
 const P50: usize = 50;
 const P99: usize = 99;
 const PERCENT: usize = 100;
+
+// A fixture path such as `src/m3/f19.rs`, kept inline.
+type RelPath = ArrayString<24>;
 
 struct Case {
 	name: &'static str,
@@ -53,7 +61,7 @@ fn commit(dir: &Path) -> io::Result<Output> {
 	return git(dir, &["commit", "-q", "--allow-empty", "--no-verify", "-m", "bench"]);
 }
 
-fn fixtures(tmp: &Path) -> io::Result<Vec<Case>> {
+fn fixtures(tmp: &Path) -> io::Result<[Case; CASES]> {
 	let manifest: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 	let loose: PathBuf = tmp.join("loose");
 	let packed: PathBuf = tmp.join("packed");
@@ -69,7 +77,7 @@ fn fixtures(tmp: &Path) -> io::Result<Vec<Case>> {
 	git(&detached, &["switch", "-q", "--detach", "HEAD"])?;
 	let worktree_arg: &str = worktree.to_str().ok_or_else(|| return io::Error::other("temp worktree path is not UTF-8"))?;
 	git(&loose, &["worktree", "add", "-q", "-b", "side", worktree_arg])?;
-	return Ok(vec![
+	return Ok([
 		Case { name: "temp repo, loose ref", dir: loose },
 		Case { name: "temp repo, packed ref", dir: packed },
 		Case { name: "temp repo, detached", dir: detached },
@@ -79,15 +87,16 @@ fn fixtures(tmp: &Path) -> io::Result<Vec<Case>> {
 	]);
 }
 
-fn time_each(iters: usize, mut op: impl FnMut() -> io::Result<()>) -> io::Result<Vec<Duration>> {
-	(0..WARMUP_ITERS.min(iters)).try_for_each(|_| return op())?;
-	let mut times: Vec<Duration> = (0..iters)
-		.map(|_| -> io::Result<Duration> {
-			let start: Instant = Instant::now();
-			op()?;
-			return Ok(start.elapsed());
-		})
-		.collect::<io::Result<Vec<Duration>>>()?;
+// `N` timed runs of `op` after a warmup, sorted so a percentile is an index.
+fn time_each<const N: usize>(mut op: impl FnMut() -> io::Result<()>) -> io::Result<[Duration; N]> {
+	(0..WARMUP_ITERS.min(N)).try_for_each(|_| return op())?;
+	let mut times: [Duration; N] = [Duration::ZERO; N];
+	times.iter_mut().try_for_each(|time: &mut Duration| -> io::Result<()> {
+		let start: Instant = Instant::now();
+		op()?;
+		*time = start.elapsed();
+		return Ok(());
+	})?;
 	times.sort_unstable();
 	return Ok(times);
 }
@@ -110,15 +119,15 @@ fn table(out: &mut impl Write) -> io::Result<()> {
 	fixtures(tmp.path())?.iter().try_for_each(|case: &Case| -> io::Result<()> {
 		let dir: &Path = &case.dir;
 		assert!(gitblitz::read_head(dir).is_ok() && gitblitz::read_git_dir(dir).is_ok(), "{} missed", case.name);
-		let git_dir: Vec<Duration> = time_each(FAST_ITERS, || {
+		let git_dir: [Duration; FAST_ITERS] = time_each(|| {
 			drop(black_box(gitblitz::read_git_dir(black_box(dir))));
 			return Ok(());
 		})?;
-		let head: Vec<Duration> = time_each(FAST_ITERS, || {
+		let head: [Duration; FAST_ITERS] = time_each(|| {
 			drop(black_box(gitblitz::read_head(black_box(dir))));
 			return Ok(());
 		})?;
-		let spawn: Vec<Duration> = time_each(GIT_ITERS, || {
+		let spawn: [Duration; GIT_ITERS] = time_each(|| {
 			black_box(git(dir, &["rev-parse", "HEAD"])?);
 			return Ok(());
 		})?;
@@ -138,7 +147,7 @@ fn table(out: &mut impl Write) -> io::Result<()> {
 	let unborn: PathBuf = tmp.path().join("unborn");
 	fs::create_dir(&unborn)?;
 	git(&unborn, &["init", "-q", "-b", "main"])?;
-	let fallback: Vec<Duration> = time_each(GIT_ITERS, || {
+	let fallback: [Duration; GIT_ITERS] = time_each(|| {
 		drop(black_box(gitblitz::head(black_box(&unborn), GitEnv::NONE)));
 		return Ok(());
 	})?;
@@ -167,13 +176,14 @@ fn git_stdin(dir: &Path, args: &[&str], input: &[u8]) -> io::Result<Output> {
 }
 
 // A repo of OBJECT_FILES files edited over OBJECT_COMMITS commits, then packed with deltas when `is_packed`.
-fn object_fixture(dir: &Path, gc_args: Option<&[&str]>) -> io::Result<Vec<String>> {
+fn object_fixture(dir: &Path, gc_args: Option<&[&str]>) -> io::Result<[RelPath; OBJECT_FILES]> {
 	fs::create_dir(dir)?;
 	git(dir, &["init", "-q", "-b", "main"])?;
-	let paths: Vec<String> = (0..OBJECT_FILES).map(|i| return format!("src/m{}/f{i}.rs", i % 4)).collect();
+	let mut paths: [RelPath; OBJECT_FILES] = [RelPath::new(); OBJECT_FILES];
+	paths.iter_mut().enumerate().try_for_each(|(i, rel)| return write!(rel, "src/m{}/f{i}.rs", i % 4)).map_err(io::Error::other)?;
 	(0..OBJECT_COMMITS).try_for_each(|round: usize| -> io::Result<()> {
-		paths.iter().enumerate().try_for_each(|(i, rel): (usize, &String)| -> io::Result<()> {
-			let path: PathBuf = dir.join(rel);
+		paths.iter().enumerate().try_for_each(|(i, rel): (usize, &RelPath)| -> io::Result<()> {
+			let path: PathBuf = dir.join(rel.as_str());
 			fs::create_dir_all(path.parent().unwrap_or(dir))?;
 			let body: String = (0..=round).map(|r| return format!("fn f{i}_{r}() -> u32 {{ return {r}; }}\n")).collect();
 			return fs::write(path, body);
@@ -193,28 +203,31 @@ fn object_rows(out: &mut impl Write, tmp: &Path) -> io::Result<()> {
 	writeln!(out, "{:<16} {:>22} {:>22} {:>22} {:>22}", "objects", "read_objects p50", "cat-file --batch p50", "read_tree_entries p50", "ls-tree -l p50")?;
 	return shapes.iter().enumerate().try_for_each(|(n, (name, gc_args))| -> io::Result<()> {
 		let dir: PathBuf = tmp.join(format!("objects{n}"));
-		let paths: Vec<String> = object_fixture(&dir, *gc_args)?;
-		let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let paths: [RelPath; OBJECT_FILES] = object_fixture(&dir, *gc_args)?;
+		let path_refs: [&str; OBJECT_FILES] = paths.each_ref().map(RelPath::as_str);
 		let head: String = String::from_utf8_lossy(&git(&dir, &["rev-parse", "HEAD"])?.stdout).trim().to_owned();
 		let commit: Oid = Oid::parse(&head).map_err(io::Error::other)?;
 		let entries = gitblitz::read_tree_entries(&dir, &commit, &path_refs).map_err(io::Error::other)?;
 		let oids: Vec<Oid> = entries.iter().map(|e| return e.oid).collect();
 		let input: Vec<u8> = oids.iter().flat_map(|oid| return format!("{oid}\n").into_bytes()).collect();
-		let read: Vec<Duration> = time_each(OBJECT_ITERS, || {
+		let read: [Duration; OBJECT_ITERS] = time_each(|| {
 			black_box(gitblitz::read_objects(black_box(&dir), &oids, OBJECT_CAP).map_err(io::Error::other)?);
 			return Ok(());
 		})?;
-		let batch: Vec<Duration> = time_each(OBJECT_GIT_ITERS, || {
+		let batch: [Duration; OBJECT_GIT_ITERS] = time_each(|| {
 			black_box(git_stdin(&dir, &["cat-file", "--batch"], &input)?);
 			return Ok(());
 		})?;
-		let tree: Vec<Duration> = time_each(OBJECT_ITERS, || {
+		let tree: [Duration; OBJECT_ITERS] = time_each(|| {
 			black_box(gitblitz::read_tree_entries(black_box(&dir), &commit, &path_refs).map_err(io::Error::other)?);
 			return Ok(());
 		})?;
-		let mut ls_args: Vec<&str> = vec!["ls-tree", "-l", &head, "--"];
-		ls_args.extend(&path_refs);
-		let ls: Vec<Duration> = time_each(OBJECT_GIT_ITERS, || {
+		let mut ls_args: ArrayVec<&str, { LS_TREE_ARGS + OBJECT_FILES }> = ArrayVec::new();
+		ls_args
+			.try_extend_from_slice(&["ls-tree", "-l", &head, "--"])
+			.and_then(|()| return ls_args.try_extend_from_slice(&path_refs))
+			.map_err(|err| return io::Error::other(err.to_string()))?;
+		let ls: [Duration; OBJECT_GIT_ITERS] = time_each(|| {
 			black_box(git(&dir, &ls_args)?);
 			return Ok(());
 		})?;
@@ -238,7 +251,7 @@ fn list_rows(out: &mut impl Write) -> io::Result<()> {
 	let manifest: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 	return [manifest.clone(), manifest.join("src")].iter().try_for_each(|dir: &PathBuf| -> io::Result<()> {
 		let listed: usize = gitblitz::read_files(dir).map_err(io::Error::other)?.len();
-		let times: Vec<Duration> = time_each(LIST_ITERS, || {
+		let times: [Duration; LIST_ITERS] = time_each(|| {
 			drop(black_box(gitblitz::read_files(black_box(dir))));
 			return Ok(());
 		})?;

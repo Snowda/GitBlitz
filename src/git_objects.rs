@@ -7,8 +7,8 @@ use arrayvec::ArrayString;
 use foldhash::HashMap;
 
 use crate::env::GitEnv;
-use crate::error::{Cause, Error, Miss, MissReason, Unparsed};
-use crate::fallback;
+use crate::error::{Error, Miss, MissReason, Unparsed};
+use crate::fallback::{self, Failed};
 use crate::objects::{read_objects, read_tree_entries, Header, ObjectKind, Objects, Oid, TreeEntries, TreeHead, OID_HEX_LEN};
 use crate::span::Span;
 
@@ -32,17 +32,20 @@ pub fn objects(dir: &Path, env: GitEnv<'_>, oids: &[Oid], cap: u64) -> Result<Ob
 		Ok(found) => return Ok(found),
 		Err(miss) => miss,
 	};
-	let fail = |args: &'static [&'static str], text: Unparsed| -> Error {
-		return Error { dir: dir.to_path_buf(), args, miss: miss.clone(), cause: Cause::Unparsed(Box::new(text)) };
-	};
-	let checked: Vec<u8> = fallback::run_objects(dir, BATCH_CHECK_ARGS, [], OidLines::new(oids.iter()), env, miss.clone())?;
-	let headers: Vec<Option<Header>> = parse_batch_check(&checked, oids).map_err(|text| return fail(BATCH_CHECK_ARGS, text))?;
-	let wanted = oids.iter().zip(&headers).filter(|(_, h)| return h.is_some_and(|h| return h.size <= cap)).map(|(oid, _)| return oid);
+	return objects_by_git(dir, env, oids, cap).map_err(|failed| return failed.with(dir, miss));
+}
+
+// `git cat-file --batch-check` for every id, then `--batch` for those found within `cap`.
+fn objects_by_git(dir: &Path, env: GitEnv<'_>, oids: &[Oid], cap: u64) -> Result<Objects, Failed> {
+	let checked: Vec<u8> = fallback::run_objects(dir, BATCH_CHECK_ARGS, [], OidLines::new(oids.iter()), env)?;
+	let headers: Vec<Option<Header>> = parse_batch_check(&checked, oids).map_err(|text| return Failed::unparsed(BATCH_CHECK_ARGS, text))?;
+	let mut wanted =
+		oids.iter().zip(&headers).filter(|(_, h)| return h.is_some_and(|h| return h.size <= cap)).map(|(oid, _)| return oid).peekable();
 	let mut batch: Vec<u8> = Vec::new();
 	let mut bodies: HashMap<Oid, (Header, Span)> = HashMap::default();
-	if wanted.clone().next().is_some() {
-		batch = fallback::run_objects(dir, BATCH_ARGS, [], OidLines::new(wanted), env, miss.clone())?;
-		bodies = parse_batch(&batch).map_err(|text| return fail(BATCH_ARGS, text))?;
+	if wanted.peek().is_some() {
+		batch = fallback::run_objects(dir, BATCH_ARGS, [], OidLines::new(wanted), env)?;
+		bodies = parse_batch(&batch).map_err(|text| return Failed::unparsed(BATCH_ARGS, text))?;
 	}
 	let slots: Vec<Option<(Header, Option<Span>)>> = oids
 		.iter()
@@ -54,10 +57,10 @@ pub fn objects(dir: &Path, env: GitEnv<'_>, oids: &[Oid], cap: u64) -> Result<Ob
 			if header.size > cap {
 				return Ok(Some((header, None)));
 			}
-			let &(found, body) = bodies.get(oid).ok_or_else(|| return fail(BATCH_ARGS, Unparsed::Object(*oid, "vanished")))?;
+			let &(found, body) = bodies.get(oid).ok_or_else(|| return Failed::unparsed(BATCH_ARGS, Unparsed::Object(*oid, "vanished")))?;
 			return Ok(Some((found, Some(body))));
 		})
-		.collect::<Result<_, Error>>()?;
+		.collect::<Result<_, Failed>>()?;
 	return Ok(Objects::from_parts(batch, slots));
 }
 
@@ -73,9 +76,9 @@ pub fn tree_entries(dir: &Path, env: GitEnv<'_>, treeish: &Oid, paths: &[&str]) 
 	};
 	let hex: ArrayString<OID_HEX_LEN> = treeish.hex();
 	let extra = [hex.as_str(), "--"].into_iter().chain(paths.iter().copied());
-	let listed: Vec<u8> = fallback::run_objects(dir, LS_TREE_ARGS, extra, io::empty(), env, miss.clone())?;
-	return parse_ls_tree(listed)
-		.map_err(|text| return Error { dir: dir.to_path_buf(), args: LS_TREE_ARGS, miss, cause: Cause::Unparsed(Box::new(text)) });
+	return fallback::run_objects(dir, LS_TREE_ARGS, extra, io::empty(), env)
+		.and_then(|listed| return parse_ls_tree(listed).map_err(|text| return Failed::unparsed(LS_TREE_ARGS, text)))
+		.map_err(|failed| return failed.with(dir, miss));
 }
 
 fn unless_redirected<T>(env: GitEnv<'_>, read: impl FnOnce() -> Result<T, Miss>) -> Result<T, Miss> {
@@ -209,13 +212,13 @@ mod tests {
 
 	use tempfile::TempDir;
 
-	use super::{objects, parse_batch, parse_batch_check, parse_ls_tree, tree_entries, OidLines};
+	use super::{objects, parse_batch, parse_batch_check, parse_ls_tree, tree_entries, OidLines, BATCH_CHECK_ARGS, LS_TREE_ARGS};
 	use crate::env::GitEnv;
 	use crate::error::{Cause, Error, MissReason, Unparsed, EXCERPT_MAX};
 	use crate::objects::test_support::{
 		batch_text, commit_all, every_mode_repo, git_ls_tree, history_repo, ls_tree_text, oid, oid_lines, put, GITLINK_TARGET, NO_CAP,
 	};
-	use crate::objects::{read_object, read_tree_entries, Header, Object, ObjectKind, ObjectRef, Objects, Oid, TreeEntries, TreeEntry};
+	use crate::objects::{read_object, read_objects, read_tree_entries, Header, Object, ObjectKind, ObjectRef, Objects, Oid, TreeEntries, TreeEntry};
 	use crate::refs::OidHex;
 	use crate::testrepo::{expect_err, git, git_bytes, new_repo, rev, Lossy, TestResult};
 
@@ -406,6 +409,22 @@ mod tests {
 		assert_eq!(read_tree_entries(dir, &oid(&head)?, &[""]).map_err(|m| m.reason), Err(MissReason::Pathspec));
 		let err: Error = expect_err(tree_entries(dir, GitEnv::NONE, &oid(&head)?, &[""]), "tree_entries(\"\")")?;
 		assert!(matches!(&err.cause, Cause::Exit { stderr, .. } if stderr.contains("not a valid pathspec")), "{err}");
+		return Ok(());
+	}
+
+	// A failed fallback carries the reader's miss whole, with the dir and the git args that failed.
+	#[test]
+	fn a_git_failure_carries_the_readers_miss_and_its_args() -> TestResult {
+		let (repo, head) = every_mode_repo()?;
+		let dir: &Path = repo.path();
+		let missed = read_tree_entries(dir, &oid(&head)?, &[""]).err();
+		let err: Error = expect_err(tree_entries(dir, GitEnv::NONE, &oid(&head)?, &[""]), "tree_entries(\"\")")?;
+		assert_eq!((err.dir.as_path(), err.args, Some(err.miss)), (dir, LS_TREE_ARGS, missed));
+		let gone: PathBuf = dir.join("gone");
+		let missed = read_objects(&gone, &[oid(A)?], NO_CAP).err();
+		let err: Error = expect_err(objects(&gone, GitEnv::NONE, &[oid(A)?], NO_CAP), "objects(gone)")?;
+		assert!(matches!(err.cause, Cause::Spawn(_)), "{err}");
+		assert_eq!((err.dir, err.args, Some(err.miss)), (gone, BATCH_CHECK_ARGS, missed));
 		return Ok(());
 	}
 
