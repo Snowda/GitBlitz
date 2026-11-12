@@ -42,7 +42,7 @@ const REPLACE_PREFIX: &[u8] = b"refs/replace/";
 const REF_STORAGE_KEY: &str = "refstorage";
 const OBJECT_FORMAT_KEYS: [&str; 2] = ["objectformat", "compatobjectformat"];
 const SHA1_NAME: &str = "sha1";
-// A tag of a tag of ... ends here; git's own peel has no limit, so a longer chain goes to git.
+// A tag of a tag of ... ends here. git's own peel has no limit, so a longer chain goes to git.
 const PEEL_MAX: usize = 64;
 const MAGIC_PREFIX: char = ':';
 
@@ -53,7 +53,7 @@ pub struct Header {
 	pub size: u64,
 }
 
-/// An object as `git cat-file --batch` prints it; `body` is `None` when `size` is over the caller's cap.
+/// An object as `git cat-file --batch` prints it. `body` is `None` when `size` is over the caller's cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object {
 	pub kind: ObjectKind,
@@ -61,12 +61,12 @@ pub struct Object {
 	pub body: Option<Vec<u8>>,
 }
 
-/// `oid`'s type and size, without reading its body; a [`Miss`] whenever the files cannot answer for sure.
+/// `oid`'s type and size from its header alone. A [`Miss`] whenever the files cannot answer for sure.
 pub fn read_object_header(dir: &Path, oid: &Oid) -> Result<Header, Miss> {
 	return open(dir)?.header(oid);
 }
 
-/// Each of `oids` as `git cat-file --batch` prints them, a body over `cap` unread; any missing one is a [`Miss`].
+/// Each of `oids` as `git cat-file --batch` prints them, a body over `cap` unread. An absent one is a [`Miss`].
 /// The bodies share one buffer.
 pub fn read_objects(dir: &Path, oids: &[Oid], cap: u64) -> Result<Objects, Miss> {
 	let store: Store = open(dir)?;
@@ -127,7 +127,7 @@ fn open(dir: &Path) -> Result<Store, Miss> {
 	return Store::open(&common.join(OBJECTS_DIR));
 }
 
-// A reftable may hold replace refs this reader cannot see; SHA-256 ids are wider than it reads.
+// A reftable may hold replace refs this reader cannot see. SHA-256 ids are wider than it reads.
 fn check_config(common: &Path) -> Result<(), Miss> {
 	let path: PathBuf = common.join(CONFIG_FILE);
 	let reason: Option<MissReason> = scan_text_lines(&path, setting_miss).map_err(|err| return Miss::io(&path, &err))?;
@@ -182,7 +182,7 @@ fn has_any_file(dir: &Path) -> Result<bool, Miss> {
 	return Ok(false);
 }
 
-// Only paths git matches literally and one at a time; with none at all, ls-tree lists the root.
+// Only paths git matches literally and one at a time. With no paths, ls-tree lists the root.
 fn check_paths(dir: &Path, paths: &[&str]) -> Result<(), Miss> {
 	let is_literal = |path: &&str| -> bool {
 		return !path.starts_with(MAGIC_PREFIX)
@@ -215,7 +215,7 @@ fn peel_to_tree(store: &Store, treeish: &Oid) -> Result<Oid, Miss> {
 	return Err(Miss::new(Path::new(treeish.hex().as_str()), MissReason::NotATree));
 }
 
-// One path from the root tree; a component that is absent, or a file or submodule mid-path, is no entry.
+// One path from the root tree. A component that is absent, or a file or submodule mid-path, is no entry.
 fn walk(store: &Store, trees: &mut HashMap<Oid, Vec<u8>>, root: Oid, path: &str) -> Result<Option<TreeHead>, Miss> {
 	let mut tree_oid: Oid = root;
 	let mut parts = path.split('/').peekable();
@@ -289,7 +289,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// A path through a file or a submodule, a wrong case, and a missing leaf all print nothing, as in git.
+	// A path through a file or a submodule, a wrong case, and an absent leaf all print nothing, as in git.
 	#[test]
 	fn absent_paths_list_nothing() -> TestResult {
 		let (repo, head) = every_mode_repo()?;
@@ -349,7 +349,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// A read that fails leaves what the buffer held; one that works lands after it.
+	// A read that fails leaves what the buffer held. One that works lands after it.
 	#[test]
 	fn a_failed_append_keeps_the_buffer() -> TestResult {
 		let (repo, head) = every_mode_repo()?;

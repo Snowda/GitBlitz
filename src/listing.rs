@@ -26,7 +26,7 @@ const INDEX_FILE: &str = "index";
 const INDEX_LOCK_FILE: &str = "index.lock";
 const INFO_EXCLUDE: &str = "info/exclude";
 const GITIGNORE_FILE: &str = ".gitignore";
-/// The most directory levels between the work tree top and `dir` that the ignore check holds; deeper is a Miss.
+/// The most directory levels between the work tree top and `dir` that the ignore check holds. Deeper is a Miss.
 pub const DIR_DEPTH_MAX: usize = 32;
 
 /// The files `git ls-files -z --cached --others --exclude-standard` run in `dir` lists, sorted.
@@ -38,7 +38,7 @@ pub fn read_files(dir: &Path) -> Result<FileList, Miss> {
 	require_head(&git_dir)?;
 	let top: &Path = &top;
 	let common: PathBuf = common_dir(&git_dir)?;
-	// Without a config file, git uses SHA-1 and does not fold case; so does this reader.
+	// Without a config file, git uses SHA-1 and does not fold case. This reader does the same.
 	let config: RepoConfig = config::read(&common.join(CONFIG_FILE))?.unwrap_or_default();
 	if config.object_format != ObjectFormat::Sha1 {
 		return Err(Miss::new(&git_dir, MissReason::ObjectFormat));
@@ -61,7 +61,7 @@ pub fn read_files(dir: &Path) -> Result<FileList, Miss> {
 	return Ok(files);
 }
 
-// The dedup drops a walked path equal to a tracked one; with `core.ignoreCase`, this drops one that differs only in case.
+// The dedup drops a walked path equal to a tracked one. With `core.ignoreCase`, this drops one that differs only in case.
 fn untracked_filter(tracked: &FileList, is_case_folded: bool) -> impl FnMut(&str) -> bool + use<> {
 	let folded: Option<HashSet<String>> = is_case_folded.then(|| return tracked.texts().map(str::to_lowercase).collect());
 	let mut lower: String = String::new();
@@ -116,7 +116,7 @@ fn is_ignored_dir(dir: &Path, levels: &[Gitignore], shared: &[Gitignore]) -> boo
 	return false;
 }
 
-// Patterns in `file` anchored at `root`; a file that is absent or unreadable matches nothing, as in git.
+// Patterns in `file` anchored at `root`. A file that is absent or unreadable matches nothing, as in git.
 fn matcher(root: &Path, file: &Path, is_case_folded: bool) -> Gitignore {
 	let mut builder: GitignoreBuilder = GitignoreBuilder::new(root);
 	builder.case_insensitive(is_case_folded).ok();
@@ -273,7 +273,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// No config means no case folding and SHA-1, as git assumes too.
+	// With no config, git does not fold case and uses SHA-1. The reader does the same.
 	#[test]
 	fn a_missing_config_reads_as_empty() -> TestResult {
 		let repo = work_tree()?;
@@ -282,7 +282,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// An index or config that does not read as a file is an I/O miss, never an empty listing.
+	// An index or config that does not read as a file is an I/O miss, never an empty list.
 	#[test]
 	fn an_unreadable_index_or_config_is_an_io_miss() -> TestResult {
 		let repo = new_repo()?;
@@ -453,7 +453,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// The oracle is the old filter, `str::to_lowercase` on every path, including non-ASCII and final sigma.
+	// The oracle is the old filter: `str::to_lowercase` on every path, also on non-ASCII paths and a final sigma.
 	#[test]
 	fn the_folded_filter_matches_to_lowercase_on_every_path() {
 		let mut tracked: FileList = FileList::default();

@@ -9,11 +9,11 @@ pub const HEAD_FILE: &str = "HEAD";
 pub const DOT_GIT: &str = ".git";
 const GITDIR_PREFIX: &str = "gitdir: ";
 
-/// The absolute git dir for `dir` from the `.git` dir or file of its nearest ancestor, without spawning `git`:
-/// git's answer when no `GIT_*` variable redirects discovery.
+/// The absolute git dir for `dir` from the `.git` dir or file of its nearest ancestor. It does not spawn `git`.
+/// This is git's answer when no `GIT_*` variable redirects discovery.
 ///
 /// # Errors
-/// A [`Miss`] whenever git might answer differently; [`crate::git_dir`] then asks git.
+/// A [`Miss`] whenever git might answer differently. Then [`crate::git_dir`] asks git.
 pub fn read_git_dir(dir: &Path) -> Result<PathBuf, Miss> {
 	let git_dir: PathBuf = locate(dir)?.git_dir;
 	require_head(&git_dir)?;
@@ -111,14 +111,14 @@ fn from_dot_git(level: &Path, dot_git: PathBuf, meta: &Metadata) -> Result<PathB
 	};
 	let joined: PathBuf = level.join(target);
 	let lexical: PathBuf = without_dots(&joined);
-	// Lexical `..` matches git's realpath unless a symlink sits on the way; only trust it if both agree.
+	// Lexical `..` matches git's realpath unless a symlink sits on the way. Trust it only if both agree.
 	if lexical != joined && fs::canonicalize(&lexical).ok() != fs::canonicalize(&joined).ok() {
 		return Err(Miss::new(&joined, MissReason::BadGitFile));
 	}
 	return Ok(lexical);
 }
 
-// `/x` on Windows has a root but no drive; the reader would have to guess the drive, so git decides.
+// `/x` on Windows has a root but no drive. The reader would have to guess the drive, so git decides.
 fn is_drive_relative(path: &Path) -> bool {
 	return path.has_root() && !path.is_absolute();
 }
@@ -297,7 +297,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// Only an absent HEAD or a directory is `NoHead`; another open error on a file stays an IO miss.
+	// Only an absent HEAD or a directory is `NoHead`. Another open error on a file stays an IO miss.
 	#[test]
 	fn no_head_keeps_other_errors_on_a_file_as_io() -> IoResult<()> {
 		let root: TempDir = tempdir()?;
@@ -353,7 +353,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// `link/..` is `x` to the kernel but `work` to a lexical fold; the two disagree, so git decides.
+	// `link/..` is `x` to the kernel but `work` to a lexical fold. The two disagree, so git decides.
 	// Windows folds `..` before it follows a link, so the two always agree there and this branch is Unix-only.
 	#[cfg(unix)]
 	#[test]

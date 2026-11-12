@@ -23,7 +23,7 @@ const PACK_EXTENSION: &str = "pack";
 const ALTERNATES: &str = "info/alternates";
 /// Longest delta chain followed: git caps `pack.depth` at 4095, so a longer chain is a cycle or corruption.
 pub const MAX_CHAIN: usize = 4096;
-/// Most deltas a read applies, held on the stack; `gc --aggressive` packs to depth 50, `--depth 250` still fits.
+/// Most deltas a read applies, held on the stack. `gc --aggressive` packs to depth 50, and `--depth 250` still fits.
 pub const READ_DEPTH_MAX: usize = 256;
 
 /// The (pack, offset) of each delta above a chain's base, top first.
@@ -68,10 +68,10 @@ impl Store {
 		return Ok(Self { objects: objects.to_path_buf(), packs });
 	}
 
-	/// `oid`'s type and size, without inflating its body: a delta's size comes from its own header.
+	/// `oid`'s type and size. The body stays compressed: a delta's size comes from its own header.
 	///
 	/// # Errors
-	/// `MissingObject` (or `Alternates`) when no copy is here; `Malformed` or `DeltaChain` for a bad store.
+	/// `MissingObject` (or `Alternates`) when no copy is here. `Malformed` or `DeltaChain` for a bad store.
 	pub fn header(&self, oid: &Oid) -> Result<Header, Miss> {
 		let (pack, offset) = match self.place(oid)? {
 			Place::Loose(loose) => return Ok(loose.header),
@@ -95,7 +95,7 @@ impl Store {
 		return Ok(Object { kind: header.kind, size: header.size, body: Some(body) });
 	}
 
-	/// [`Self::read`] with the body put onto the end of `out`; on an error, `out` keeps only what it held.
+	/// [`Self::read`] with the body put onto the end of `out`. On an error, `out` keeps only what it held.
 	pub fn read_into(&self, oid: &Oid, out: &mut Vec<u8>) -> Result<Header, Miss> {
 		let start: usize = out.len();
 		let kind: ObjectKind = match self.place(oid)? {
@@ -159,7 +159,7 @@ impl Store {
 		return Err(Miss::new(self.pack(pack)?.path(), MissReason::DeltaChain));
 	}
 
-	// Applies the chain's deltas from the bottom up, swapping two body buffers and reusing one for the ops.
+	// Applies the chain's deltas from the bottom up. Two body buffers swap, and one buffer holds the ops each time.
 	// The top delta, or a base with none above it, writes straight onto the end of `out`.
 	fn read_packed(&self, pack: usize, offset: u64, out: &mut Vec<u8>) -> Result<ObjectKind, Miss> {
 		let (base, deltas) = self.chain_base(pack, offset)?;
@@ -356,7 +356,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// A read holds at most READ_DEPTH_MAX deltas; a deeper chain misses for git, though its header still answers.
+	// A read holds at most READ_DEPTH_MAX deltas. A deeper chain misses for git, but its header still answers.
 	#[test]
 	fn a_chain_deeper_than_the_read_buffer_misses_only_the_read() -> TestResult {
 		let nth = |n: usize| -> [u8; OID_LEN] {

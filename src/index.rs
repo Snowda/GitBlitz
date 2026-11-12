@@ -29,13 +29,13 @@ const ENTRY_ALIGN: usize = 8;
 const SPARSE_DIR_MODE: u32 = 0o040_000;
 const EXTENSION_HEADER_LEN: usize = 8;
 const TRAILING_CHECKSUM_LEN: usize = SHA1_LEN;
-// A split index keeps entries in another file; a sparse index collapses directories into one entry.
+// A split index keeps entries in another file. A sparse index collapses directories into one entry.
 const UNSUPPORTED_EXTENSIONS: [&[u8; 4]; 2] = [b"link", b"sdir"];
 
 /// Every path the index tracks, repo-relative with `/` separators, in index order.
 ///
 /// # Errors
-/// A [`Miss`] (naming `path`) for any layout this reader does not settle.
+/// A [`Miss`] that names `path`, for any layout this reader does not settle.
 pub fn tracked_paths(bytes: Vec<u8>, path: &Path) -> Result<FileList, Miss> {
 	return read_paths(bytes).map_err(|reason: MissReason| return Miss::new(path, reason));
 }
@@ -112,7 +112,7 @@ fn header(bytes: &[u8]) -> Result<(u32, usize), MissReason> {
 	return Ok((version, usize::try_from(count).map_err(|_| MissReason::Malformed)?));
 }
 
-// The flags of the entry at `start` and where its name starts; an entry git must list itself is a Miss.
+// The flags of the entry at `start` and where its name starts. An entry that git must list itself is a Miss.
 fn name_start(bytes: &[u8], start: usize) -> Result<(usize, u16), MissReason> {
 	let mode: u32 = be_u32(bytes, start + MODE_OFFSET).ok_or(MissReason::Malformed)?;
 	let flags: u16 = be_u16(bytes, start + ENTRY_FIXED_LEN - 2).ok_or(MissReason::Malformed)?;
@@ -123,8 +123,8 @@ fn name_start(bytes: &[u8], start: usize) -> Result<(usize, u16), MissReason> {
 	return Ok((start + ENTRY_FIXED_LEN + extended, flags));
 }
 
-// v4: the previous path less `strip` bytes from its end, then the suffix; the cut may fall inside a character.
-// The path goes on the end of `names`, whose previous path starts at `previous`; returns where the next entry starts.
+// v4: the previous path less `strip` bytes from its end, then the suffix. The cut may fall inside a character.
+// The path goes on the end of `names`, whose previous path starts at `previous`. Returns where the next entry starts.
 fn compressed_name(bytes: &[u8], start: usize, names: &mut Vec<u8>, previous: usize) -> Result<usize, MissReason> {
 	let (pos, _) = name_start(bytes, start)?;
 	let (strip, used) = varint(bytes, pos).ok_or(MissReason::Malformed)?;
@@ -135,7 +135,7 @@ fn compressed_name(bytes: &[u8], start: usize, names: &mut Vec<u8>, previous: us
 	return Ok(pos + used + suffix.len() + 1);
 }
 
-// v2/v3: the flags hold the name length (or 0xFFF for a longer, NUL-terminated name); NUL bytes pad the entry.
+// v2/v3: the flags hold the name length (or 0xFFF for a longer, NUL-terminated name). NUL bytes pad the entry.
 // Returns where the name lies in `bytes` and where the next entry starts.
 fn padded_name(bytes: &[u8], start: usize) -> Result<(Range<usize>, usize), MissReason> {
 	let (pos, flags) = name_start(bytes, start)?;
@@ -243,7 +243,7 @@ mod tests {
 		return out;
 	}
 
-	// Header, `entries`, `extensions`, then a zero trailing checksum.
+	// Header, `entries`, `extensions`, then 20 zero bytes as the checksum.
 	fn index(version: u32, entries: &[Vec<u8>], extensions: &[u8]) -> Vec<u8> {
 		let mut out: Vec<u8> = b"DIRC".to_vec();
 		out.extend_from_slice(&version.to_be_bytes());
@@ -254,7 +254,7 @@ mod tests {
 		return out;
 	}
 
-	// The reader keeps index order; `read_files` sorts.
+	// The reader keeps index order. `read_files` sorts.
 	fn paths(bytes: &[u8]) -> Result<Vec<String>, MissReason> {
 		let files: FileList = tracked_paths(bytes.to_vec(), Path::new("index")).map_err(|m| m.reason)?;
 		return Ok(files.texts().map(String::from).collect());
@@ -312,7 +312,7 @@ mod tests {
 		assert_eq!(paths(&index(3, &entries, &extension(b"TREE", b"\0\0"))), owned(&["a", &long, "c.rs", &longer]));
 	}
 
-	// v3's extended flag puts two bytes before the name; skipping them keeps the name and the next entry intact.
+	// v3's extended flag puts two bytes before the name. The reader skips them and keeps the name and the next entry intact.
 	#[test]
 	fn a_v3_extended_entry_skips_its_extra_flag_bytes() {
 		let entries: [Vec<u8>; 2] = [entry(REGULAR, 0x4000 | 4, b"x.rs"), named("y.rs")];
@@ -346,7 +346,7 @@ mod tests {
 	#[test]
 	fn the_offset_varint_matches_gits_encoding() {
 		assert_eq!(varint(&[0x05], 0), Some((5, 1)));
-		// 0x80 0x00 is 128 in git's encoding (each continuation adds one), not 0 as in LEB128.
+		// 0x80 0x00 is 128 to git (each continuation adds one), not 0 as in LEB128.
 		assert_eq!(varint(&[0x80, 0x00], 0), Some((128, 2)));
 		assert_eq!(varint(&[0x81, 0x7F], 0), Some((383, 2)));
 		assert_eq!(varint(&[0x80], 0), None, "a continuation with no next byte");

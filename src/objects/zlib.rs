@@ -13,7 +13,7 @@ use miniz_oxide::inflate::TINFLStatus;
 use super::read_at::read_at;
 
 pub const CHUNK: usize = 16 * 1024;
-// One output buffer holds the whole object, so back-references never need a wrapping window.
+// One output buffer holds the whole object, so back-references never need a window that wraps around.
 const FLAGS: u32 = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | TINFL_FLAG_COMPUTE_ADLER32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,7 @@ impl From<IoError> for InflateError {
 }
 
 impl<'f> Input<'f> {
-	/// The bytes of `file` from `pos`, with the first chunk read; errors are the read error.
+	/// The bytes of `file` from `pos`, with the first chunk read. Errors are the read error.
 	pub fn at(file: &'f File, pos: u64) -> Result<Self, IoError> {
 		let mut input: Self = Self { file, next: pos, buf: [0; CHUNK], start: 0, end: 0, tail: Tail::More };
 		input.refill()?;
@@ -77,7 +77,7 @@ impl<'f> Input<'f> {
 		return Ok(());
 	}
 
-	// Moves the unconsumed bytes to the front and reads after them; a read of nothing marks the end.
+	// Moves the unconsumed bytes to the front and reads after them. A read of nothing marks the end.
 	fn refill(&mut self) -> Result<(), IoError> {
 		self.buf.copy_within(self.start..self.end, 0);
 		self.end -= self.start;
@@ -96,7 +96,7 @@ impl<'f> Input<'f> {
 	}
 }
 
-/// Inflates the zlib stream at `input` into `out`, stopping when `out` is full; `Corrupt` for bad zlib.
+/// Inflates the zlib stream at `input` into `out` until the stream ends or `out` is full. `Corrupt` for bad zlib.
 pub fn inflate(input: &mut Input<'_>, out: &mut [u8]) -> Result<Fill, InflateError> {
 	let mut state: DecompressorOxide = DecompressorOxide::new();
 	let mut written: usize = 0;
@@ -114,7 +114,7 @@ pub fn inflate(input: &mut Input<'_>, out: &mut [u8]) -> Result<Fill, InflateErr
 	}
 }
 
-/// Inflates a stream that must hold exactly `size` bytes; `Corrupt` when it is shorter or longer.
+/// Inflates a stream that must hold exactly `size` bytes. `Corrupt` when it is shorter or longer.
 #[cfg(test)]
 pub fn inflate_exact(input: &mut Input<'_>, size: usize) -> Result<Vec<u8>, InflateError> {
 	let mut out: Vec<u8> = Vec::new();
@@ -122,9 +122,9 @@ pub fn inflate_exact(input: &mut Input<'_>, size: usize) -> Result<Vec<u8>, Infl
 	return Ok(out);
 }
 
-/// The `size` bytes of the stream onto the end of `out`, with the errors of `inflate_exact`; on an error, `out` keeps only what it held.
+/// The `size` bytes of the stream onto the end of `out`, with the errors of `inflate_exact`. On an error, `out` keeps only what it held.
 pub fn inflate_exact_append(input: &mut Input<'_>, size: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
-	// One spare byte shows a stream longer than declared without relying on how the inflater reports a full buffer.
+	// One spare byte shows a stream longer than declared. Then no check depends on how the inflater reports a full buffer.
 	let start: usize = out.len();
 	out.try_reserve(size + 1).map_err(|_| InflateError::Io(ErrorKind::OutOfMemory))?;
 	out.resize(start + size + 1, 0);
@@ -157,7 +157,7 @@ mod tests {
 		return Ok((dir, file));
 	}
 
-	// Output spanning several input chunks inflates whole, and a stream after a prefix starts where told.
+	// Output from several input chunks inflates whole, and a stream after a prefix starts where told.
 	#[test]
 	fn a_stream_bigger_than_a_chunk_inflates_exactly() -> IoResult<()> {
 		let body: Vec<u8> = (0..CHUNK * 5).map(|i| u8::try_from(i * 7 % 251).unwrap_or(0)).collect();

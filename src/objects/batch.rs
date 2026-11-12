@@ -5,7 +5,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use super::{Header, Object, ObjectKind, Oid};
 use crate::span::Span;
 
-/// One object of an [`Objects`] batch, its body borrowed from the batch; `body` is `None` over the caller's cap.
+/// One object of an [`Objects`] batch, its body borrowed from the batch. `body` is `None` over the caller's cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectRef<'o> {
 	pub kind: ObjectKind,
@@ -21,7 +21,7 @@ impl ObjectRef<'_> {
 	}
 }
 
-/// Objects as `git cat-file --batch` prints them, in the order asked; `None` for one git says is missing.
+/// Objects as `git cat-file --batch` prints them, in the order asked. `None` for an object that git reports as absent.
 #[derive(Clone, Default)]
 pub struct Objects {
 	buf: Vec<u8>,
@@ -44,7 +44,7 @@ impl Objects {
 		self.slots.push(Some((header, None)));
 	}
 
-	/// An object whose body `read` puts onto the end of the shared buffer; on an error, the batch is unchanged.
+	/// An object whose body `read` puts onto the end of the shared buffer. On an error, the batch stays as it was.
 	pub(crate) fn push_read<E>(&mut self, read: impl FnOnce(&mut Vec<u8>) -> Result<Header, E>) -> Result<(), E> {
 		let start: usize = self.buf.len();
 		let header: Header = read(&mut self.buf)?;
@@ -68,13 +68,13 @@ impl Objects {
 		return self.slots.is_empty();
 	}
 
-	/// The object at `at`; `None` past the end or where git said missing.
+	/// The object at `at`. `None` past the end or where git reported the object as absent.
 	#[must_use]
 	pub fn get(&self, at: usize) -> Option<ObjectRef<'_>> {
 		return self.slots.get(at).copied().flatten().map(|slot| return self.object(slot));
 	}
 
-	/// Each object in the order asked, `None` where git said missing.
+	/// Each object in the order asked, `None` where git reported it as absent.
 	pub fn iter(&self) -> impl ExactSizeIterator<Item = Option<ObjectRef<'_>>> + DoubleEndedIterator {
 		return self.slots.iter().map(|slot| return slot.map(|slot| return self.object(slot)));
 	}
@@ -198,7 +198,7 @@ mod tests {
 
 	const BLOB: Header = Header { kind: ObjectKind::Blob, size: 2 };
 
-	// A read slot, an unread slot and a missing slot, the reads laid out as `buf`.
+	// A read slot, an unread slot and an empty slot, the reads laid out as `buf`.
 	fn three(buf: &[u8]) -> Objects {
 		return Objects::from_parts(buf.to_vec(), vec![Some((BLOB, Some(Span::new(buf.len() - 2, buf.len())))), Some((BLOB, None)), None]);
 	}
@@ -221,7 +221,7 @@ mod tests {
 		assert_ne!(three(b"ab"), three(b"ac"));
 	}
 
-	// A read that fails leaves the batch as it was; one that works adds a slot over what it appended.
+	// A read that fails leaves the batch as it was. One that works adds a slot over what it appended.
 	#[test]
 	fn push_read_adds_a_slot_only_when_the_read_works() -> TestResult {
 		let mut batch: Objects = Objects::with_capacity(2);

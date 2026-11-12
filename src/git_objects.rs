@@ -20,9 +20,9 @@ const NO_SIZE: &str = "-";
 const OCTAL: u32 = 8;
 const OID_LINE_LEN: usize = OID_HEX_LEN + 1;
 
-/// Each of `oids` as `git cat-file --batch` run in `dir` with `env` prints it, `None` where git says `missing`.
+/// Each of `oids` as `git cat-file --batch` run in `dir` with `env` prints it, `None` for an id git reports as absent.
 ///
-/// A body over `cap` bytes is not read. [`read_objects`] answers from the files; a [`Miss`] runs git,
+/// A body over `cap` bytes is not read. [`read_objects`] answers from the files. A [`Miss`] runs git,
 /// and the bodies then stay where git printed them.
 ///
 /// # Errors
@@ -65,7 +65,7 @@ fn objects_by_git(dir: &Path, env: GitEnv<'_>, oids: &[Oid], cap: u64) -> Result
 }
 
 /// The entries `git ls-tree --full-tree -l <treeish> -- <paths>` run in `dir` with `env` prints.
-/// [`read_tree_entries`] answers from the files; a [`Miss`] runs git.
+/// [`read_tree_entries`] answers from the files. A [`Miss`] runs git.
 ///
 /// # Errors
 /// [`Error`] when the file path missed and git failed too, or printed what this does not parse.
@@ -124,7 +124,7 @@ impl<'o, I: Iterator<Item = &'o Oid>> Read for OidLines<I> {
 	}
 }
 
-// One `<oid> <type> <size>` or `<oid> missing` line per asked id, in order.
+// One `<oid> <type> <size>` line per asked id, in order, or `<oid>` then [`MISSING`] for an absent one.
 fn parse_batch_check(out: &[u8], oids: &[Oid]) -> Result<Vec<Option<Header>>, Unparsed> {
 	let text: &str = str::from_utf8(out).map_err(|_| return Unparsed::NotUtf8("batch-check output"))?;
 	let count: usize = text.lines().count();
@@ -148,7 +148,7 @@ fn parse_batch_header(line: &str) -> Result<(Oid, Option<Header>), Unparsed> {
 	return Ok((oid, Some(Header { kind, size })));
 }
 
-// `<oid> <type> <size>\n<body>\n` per object found, each body a span of `out`; `<oid> missing\n` carries no body.
+// `<oid> <type> <size>\n<body>\n` per object found, each body a span of `out`. An absent object's line carries no body.
 fn parse_batch(out: &[u8]) -> Result<HashMap<Oid, (Header, Span)>, Unparsed> {
 	let mut found: HashMap<Oid, (Header, Span)> = HashMap::default();
 	let mut at: usize = 0;
@@ -187,7 +187,7 @@ fn parse_ls_tree(out: Vec<u8>) -> Result<TreeEntries, Unparsed> {
 	return Ok(TreeEntries::from_parts(text, entries));
 }
 
-// One record that starts at `start`; the size is right-aligned and `-` for a tree or a gitlink.
+// One record that starts at `start`. The size is right-aligned, and `-` for a tree or a gitlink.
 fn parse_ls_tree_record(record: &[u8], start: usize) -> Result<(TreeHead, Span), Unparsed> {
 	let text: &str = str::from_utf8(record).map_err(|_| return Unparsed::NotUtf8("ls-tree record"))?;
 	let bad = || return Unparsed::record(text);
@@ -280,7 +280,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// A line that fits is kept whole; a longer one keeps a char-boundary head and ends in `…`.
+	// `Unparsed::line` keeps a line that fits whole. A longer one keeps a char-boundary head and ends in `…`.
 	#[test]
 	fn a_long_line_is_cut_to_an_excerpt_on_a_char_boundary() -> TestResult {
 		let fits: String = "x".repeat(EXCERPT_MAX);
@@ -348,7 +348,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// A shared clone keeps its objects in the source's store; the reader misses and git answers through alternates.
+	// A shared clone keeps its objects in the source's store. The reader misses, and git answers through alternates.
 	#[test]
 	fn objects_behind_alternates_go_to_git() -> TestResult {
 		let source: TempDir = history_repo()?;
@@ -364,7 +364,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// With a replace ref git reads the replacement; the reader declines both as a loose ref and once packed.
+	// With a replace ref git reads the replacement. The reader declines it as a loose ref, and again once packed.
 	#[test]
 	fn replace_refs_go_to_git() -> TestResult {
 		let repo: TempDir = new_repo()?;
@@ -394,7 +394,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// Paths git rewrites or matches together are git's; the wrapper relays exactly what it prints.
+	// Paths that git rewrites or matches together are git's to list. The wrapper relays exactly what git prints.
 	#[test]
 	fn non_literal_or_overlapping_paths_go_to_git() -> TestResult {
 		let (repo, head) = every_mode_repo()?;

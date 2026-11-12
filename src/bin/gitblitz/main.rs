@@ -1,7 +1,7 @@
 //! `gitblitz <git-dir|head> [DIR]`: `git rev-parse --absolute-git-dir` / `HEAD` from the `.git` files, git as fallback.
 //! `gitblitz hook <mark|clear> --flag NAME` and `gitblitz gate --flag NAME -- <cmd>...`: edit-marker hooks without a shell.
-//! The caller sets every marker name, rule and input; stdin is read only when an input is a `--*-from` payload field.
-//! Exit 1 on failure, 2 on bad usage; `gate` exits with its command's code, or 0 when it skips.
+//! The caller sets every marker name, rule and input. The CLI reads stdin only when an input is a `--*-from` payload field.
+//! Exit 1 on failure, 2 on bad usage. `gate` exits with its command's code, or 0 when it skips.
 
 mod hook;
 mod payload;
@@ -88,7 +88,7 @@ impl Debug for Values<'_> {
 	}
 }
 
-/// How the process exits; `Gated` carries the gated command's own code through.
+/// How the process exits. `Gated` carries the gated command's own code through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exit {
 	Success,
@@ -114,7 +114,7 @@ impl From<Exit> for ExitCode {
 	}
 }
 
-/// A command line that parsed; borrows from the args, and `None` as the dir means the cwd.
+/// A command line that parsed. It borrows from the args, and `None` as the dir means the cwd.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Cli<'a> {
 	Query(Query, Option<&'a Path>),
@@ -238,7 +238,7 @@ impl<'a> Options<'a> {
 		return Flag::new(self.at_most_one(Key::Flag)??);
 	}
 
-	// An input given as `arg`, as a payload field `from`, or not at all; both at once is bad usage.
+	// An input given as `arg`, as a payload field `from`, or not at all. Both at once is bad usage.
 	fn source(self, arg: Key, from: Key) -> Option<Source<'a>> {
 		return match (self.at_most_one(arg)?, self.at_most_one(from)?) {
 			(None, None) => Some(Source::Unset),
@@ -279,7 +279,7 @@ fn hook(dir: Source<'_>, action: HookAction<'_>, cwd: &Path, stdin: &mut impl Re
 	};
 }
 
-// The input's value; a field that is absent or `null` in the payload is unset.
+// The input's value. A field that is absent or `null` in the payload is unset.
 fn resolve<'v>(source: Source<'v>, payload: &'v Value) -> Result<Option<&'v OsStr>, WrongType<'v>> {
 	return match source {
 		Source::Unset => Ok(None),
@@ -328,7 +328,7 @@ fn on_hook(action: HookAction<'_>, dir: &Path, payload: &Value, err: &mut impl W
 	};
 }
 
-// Without the gate binary there is nothing to gate; a null stdin means the command cannot block on input.
+// Without the gate binary there is nothing to gate. A null stdin means the command cannot block on input.
 fn run_gated(program: &OsStr, args: &[OsString], dir: &Path, err: &mut impl Write) -> Exit {
 	let spawned: Result<ExitStatus, io::Error> =
 		Command::new(program).args(args).current_dir(dir).stdin(Stdio::null()).status();
@@ -366,15 +366,15 @@ mod tests {
 	use super::hook::Flag;
 	use super::{emit, parse, run, Cli, Exit, HookAction, Key, Query, Source, TestResult, Values, USAGE};
 
-	// One caller's schema (Claude Code's hook payload); nothing outside these args knows it.
+	// One caller's schema (Claude Code's hook payload). Nothing outside these args knows it.
 	const NAME: &str = "test-edit-flag";
 	const MARK: [&str; 12] =
 		["hook", "mark", "--flag", NAME, "--suffix", ".rs", "--suffix", ".toml", "--dir-from", "/cwd", "--path-from", "/tool_input/file_path"];
 	const CLEAR: [&str; 6] = ["hook", "clear", "--flag", NAME, "--dir-from", "/cwd"];
-	// The most words one test call passes; a longer call is an error, not a reallocation.
+	// The most words one test call passes. A longer call is an error, not a reallocation.
 	const MAX_ARGS: usize = 16;
 
-	// The most bytes one test call prints to a stream; more fails the write, so the call exits with failure.
+	// The most bytes one test call prints to a stream. More fails the write, so the call exits with failure.
 	const CAPTURE_MAX: usize = 4096;
 
 	type Words<'a> = ArrayVec<&'a str, MAX_ARGS>;
@@ -755,7 +755,7 @@ mod tests {
 	fn plain_arguments_never_read_stdin() -> TestResult {
 		let repo: TempDir = git_init()?;
 		let dir: &str = utf8(repo.path())?;
-		// Each call must leave stderr empty; the exit code is what the asserts compare.
+		// Each call must leave stderr empty. The asserts compare the exit code.
 		let call_unreadable = |words: &[&str]| -> TestResult<Exit> {
 			let args: Argv = os_args(words)?;
 			let (mut out, mut err): (Capture, Capture) = (capture(), capture());
@@ -776,7 +776,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// A payload with another shape works through the caller's own pointers; gitblitz knows no field names.
+	// A payload with another shape works through the caller's own pointers. gitblitz knows no field names.
 	#[test]
 	fn another_payload_schema_works_through_its_own_pointers() -> TestResult {
 		let repo: TempDir = git_init()?;

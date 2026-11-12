@@ -1,9 +1,9 @@
-//! Answers `git rev-parse --absolute-git-dir` and `git rev-parse HEAD` by reading files under `.git`, and
-//! `git cat-file --batch` / `git ls-tree -l` by reading the object store ([`objects`], [`tree_entries`]).
+//! Answers `git rev-parse --absolute-git-dir` and `git rev-parse HEAD` from the files under `.git`. Answers
+//! `git cat-file --batch` / `git ls-tree -l` from the object store ([`objects`], [`tree_entries`]).
 //!
-//! [`git_dir`] and [`head`] try the file path first and spawn `git rev-parse` only when it cannot answer for
-//! sure; [`read_git_dir`] and [`read_head`] are the file path alone, returning a [`Miss`] instead of spawning.
-//! The caller passes the `GIT_*` variables git should see as a [`GitEnv`]; GitBlitz reads no environment itself.
+//! [`git_dir`] and [`head`] try the file path first. They spawn `git rev-parse` only when it cannot answer for
+//! sure. [`read_git_dir`] and [`read_head`] are the file path alone: they return a [`Miss`] and do not spawn git.
+//! The caller passes the `GIT_*` variables git should see as a [`GitEnv`]. GitBlitz reads no environment itself.
 
 mod config;
 mod discover;
@@ -52,7 +52,7 @@ const LS_FILES_ARGS: &[&str] = &["ls-files", "-z", "--cached", "--others", "--ex
 /// The absolute git directory for `dir`, as `git rev-parse --absolute-git-dir` run in `dir` with `env` reports it.
 ///
 /// # Errors
-/// [`Error`] when the file path missed and `git` failed too; it names `dir`, git's stderr and the missed path.
+/// [`Error`] when the file path missed and `git` failed too. It names `dir`, git's stderr and the missed path.
 pub fn git_dir(dir: &Path, env: GitEnv<'_>) -> Result<PathBuf, Error> {
 	return match unless_redirected(env, || return read_git_dir(dir)) {
 		Ok(path) => Ok(path),
@@ -80,13 +80,13 @@ fn unless_redirected<T>(env: GitEnv<'_>, read: impl FnOnce() -> Result<T, Miss>)
 	};
 }
 
-// git's answer as an inline oid; git checks the hex before it prints, so this only checks that the text fits.
+// git's answer as an inline oid. git checks the hex before it prints, so this only checks that the text fits.
 fn oid_hex(text: &str) -> Result<OidHex, Cause> {
 	return OidHex::from(text).map_err(|_| Cause::NotAnOid(text.len()));
 }
 
 /// The files `git ls-files -z --cached --others --exclude-standard` run in `dir` with `env` lists, relative
-/// to `dir`, sorted. [`read_files`] answers from `.git/index` and a walk; a [`Miss`] runs `git`.
+/// to `dir`, sorted. [`read_files`] answers from `.git/index` and a walk. A [`Miss`] runs `git`.
 ///
 /// # Errors
 /// [`Error`] when the file path missed and `git` failed too.
@@ -152,7 +152,7 @@ mod tests {
 		return Ok(miss);
 	}
 
-	// git's answer converts whole up to a SHA-256 oid's length; longer output is refused, not truncated.
+	// git's answer converts whole up to a SHA-256 oid's length. `oid_hex` refuses longer output and does not cut it.
 	#[test]
 	fn oid_hex_keeps_up_to_64_digits_and_refuses_more() -> TestResult {
 		let longest: String = "ab".repeat(32);
@@ -181,7 +181,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// The config selects SHA-256, so the reader takes the 64-hex ref itself; a packed ref reads the same.
+	// The config selects SHA-256, so the reader takes the 64-hex ref itself. A packed ref reads the same.
 	#[test]
 	fn sha256_repo_head_is_what_git_prints() -> TestResult {
 		let repo: TempDir = ok(tempdir(), "tempdir()")?;
@@ -324,7 +324,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// git accepts whitespace after a loose ref's oid; past the reader's buffer it misses, and git still answers.
+	// git accepts whitespace after a loose ref's oid. Past its buffer the reader misses, and git still answers.
 	#[test]
 	fn a_loose_ref_longer_than_the_read_buffer_falls_back_to_git() -> TestResult {
 		let repo: TempDir = committed_repo()?;
@@ -451,7 +451,7 @@ mod tests {
 		return Ok(());
 	}
 
-	// A helper that cannot start git returns why, so the calling test fails with that text instead of a panic.
+	// A helper that cannot start git returns why. The test that calls it then fails with that text, not a panic.
 	#[test]
 	fn git_in_a_missing_dir_returns_the_spawn_error() -> TestResult {
 		let repo = new_repo()?;
